@@ -1,0 +1,26 @@
+# Template for the Powerwall Influx systemd unit.
+#
+# This file is consumed by install-service.sh, which will prompt for the
+# placeholder values wrapped in double curly braces and generate
+# powerwall-influx.service with your local paths and user information.
+
+[Unit]
+Description=Powerwall metrics to InfluxDB
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{SERVICE_USER}}
+Group={{SERVICE_GROUP}}
+WorkingDirectory={{WORKING_DIRECTORY}}
+Environment="PATH={{VENV_BIN}}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="POWERWALL_ENV_FILE={{ENV_FILE}}"
+ExecStart={{PYTHON_BIN}} -m powerwall_service.cli serve --host 0.0.0.0 --port 8000
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

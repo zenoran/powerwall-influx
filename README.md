@@ -1,341 +1,138 @@
-# Powerwall InfluxDB Service
+# Powerwall Influx Service
 
-A lightweight service that polls Tesla Powerwall data and writes metrics to InfluxDB.
+Async FastAPI service that polls a Tesla Powerwall gateway, writes metrics to InfluxDB, and optionally publishes live telemetry to MQTT/Home Assistant.
 
-## Features
+## Quick start
 
-- 🔌 **Automatic Powerwall Connection** - Auto-connects to Powerwall Wi-Fi AP if needed
-- 📊 **Comprehensive Metrics** - Exports power, energy, voltage, current, and string data
-- 🔄 **Continuous Polling** - Configurable polling interval (default: 5 seconds)
-- 🗄️ **InfluxDB Integration** - Writes metrics in line protocol format
-- 🎯 **String-Level Solar Data** - Per-string voltage, current, power, and connection status
-- 🔧 **Systemd Service** - Run automatically on system startup
-- 🛠️ **Easy Configuration** - Simple `.env` file configuration
+1. Clone & enter the repo
+   ```bash
+   git clone <repo-url> powerwall-influx
+   cd powerwall-influx
+   ```
+2. (Optional) create a virtual environment
+   ```bash
+   python3 -m venv venv
+   source venv/bin/activate
+   ```
+3. Install dependencies
+   ```bash
+   pip install -r requirements.txt
+   ```
+4. Configure credentials
+   ```bash
+   cp .env.example .env
+   $EDITOR .env
+   ```
+5. Run a one-off poll to verify connectivity
+   ```bash
+   python -m powerwall_service.cli poll --pretty
+   ```
 
-## Requirements
+## Run modes
 
-- Python 3.8+
-- Tesla Powerwall 3 (TEDAPI mode)
-- InfluxDB v2.x
-- NetworkManager (for Wi-Fi auto-connect, optional)
+- **HTTP service (development)**
+  ```bash
+  python -m powerwall_service.cli serve --reload
+  ```
+- **HTTP service (systemd)**
+   - Run the installer; it now asks a few questions (user, group, repo path, venv path, etc.) and renders `powerwall-influx.service.template` into `powerwall-influx.service.local` for you.
+   - The generated file is gitignored and reused on subsequent runs unless you choose to regenerate it.
+   - Need to skip the connectivity smoke test (for example, when the Powerwall is offline)? prefix the command with `PW_INSTALLER_SKIP_TEST=1`.
+   ```bash
+   ./install-service.sh
+   sudo systemctl status powerwall-influx
+   ```
+   The unit starts `python -m powerwall_service.cli serve` and loads `.env` automatically.
+- **Manual poll**
+  ```bash
+  python -m powerwall_service.cli poll --no-push --include-snapshot --pretty
+  ```
+- **String status helper**
+  ```bash
+  python -m powerwall_service.string_status --env-file .env
+  ```
 
-## Installation
+## Configuration (`.env`)
 
-### 1. Clone the repository
+| Section | Keys (defaults) | Notes |
+| --- | --- | --- |
+| InfluxDB | `INFLUX_URL`, `INFLUX_ORG`, `INFLUX_BUCKET`, `INFLUX_TOKEN`, `INFLUX_MEASUREMENT=powerwall`, `INFLUX_TIMEOUT=10`, `INFLUX_VERIFY_TLS=true` | `INFLUX_TOKEN` must be set. |
+| Powerwall | `PW_HOST=192.168.91.1`, `PW_TIMEZONE=UTC`, `PW_CACHE_EXPIRE=5`, `PW_REQUEST_TIMEOUT=10`, `PW_POLL_INTERVAL=30` | TEDAPI gateway credentials required below. |
+| Credentials | `PW_CUSTOMER_EMAIL`, `PW_CUSTOMER_PASSWORD`, `PW_GATEWAY_PASSWORD` | Provide whichever combination grants access. |
+| Wi-Fi (optional) | `PW_CONNECT_WIFI`, `PW_WIFI_SSID`, `PW_WIFI_PASSWORD`, `PW_WIFI_INTERFACE` | Requires NetworkManager for auto-association. |
+| MQTT (optional) | `MQTT_ENABLED`, `MQTT_HOST`, `MQTT_PORT=1883`, `MQTT_USERNAME`, `MQTT_PASSWORD`, `MQTT_TOPIC_PREFIX=homeassistant/sensor/powerwall`, `MQTT_QOS=1`, `MQTT_RETAIN=true`, `MQTT_METRICS=` | Leave `MQTT_METRICS` empty to publish all supported metrics. |
+| Logging | `PW_LOG_LEVEL=INFO` | Use `DEBUG` for verbose troubleshooting. |
 
-```bash
-cd ~/dev
-git clone <repo-url> powerwall-influx
-cd powerwall-influx
-```
+Save changes and restart the service (or rerun the poll) after updating `.env`.
 
-### 2. Create a virtual environment (recommended)
+## MQTT integration
 
-```bash
-python3 -m venv venv
-source venv/bin/activate
-```
+### Configure `.env`
 
-### 3. Install dependencies
+| Key | Purpose |
+| --- | --- |
+| `MQTT_ENABLED` | Turn publishing on/off. |
+| `MQTT_HOST`, `MQTT_PORT` | MQTT broker address (default port 1883). |
+| `MQTT_USERNAME`, `MQTT_PASSWORD` | Optional authentication. |
+| `MQTT_TOPIC_PREFIX` | Base topic for discovery/state messages (default `homeassistant/sensor/powerwall`). |
+| `MQTT_QOS`, `MQTT_RETAIN` | Delivery semantics; defaults work well for Home Assistant. |
+| `MQTT_METRICS` | Comma-separated whitelist of metrics; leave empty to publish all. |
 
-```bash
-pip install -r requirements.txt
-```
-
-### 4. Configure the service
-
-```bash
-cp .env.example .env
-nano .env
-```
-
-Edit `.env` with your settings:
-- InfluxDB URL, token, organization, and bucket
-- Powerwall IP address and credentials
-- Wi-Fi settings (if using auto-connect)
-- Polling interval
-
-### 5. Test the service
-
-```bash
-# Single poll test
-python -m powerwall_service.influx_service --env-file .env --once
-
-# Continuous mode (Ctrl+C to stop)
-python -m powerwall_service.influx_service --env-file .env
-```
-
-## Usage
-
-### Run Manually
-
-```bash
-# Activate virtual environment (if using one)
-source venv/bin/activate
-
-# Single poll
-python -m powerwall_service.influx_service --env-file .env --once
-
-# Continuous polling
-python -m powerwall_service.influx_service --env-file .env
-```
-
-### Install as Systemd Service
-
-For automatic startup on boot:
+After editing the file, restart the service:
 
 ```bash
-./install-service.sh
-```
-
-This will:
-1. Test the service
-2. Install the systemd service file
-3. Enable autostart on boot
-4. Start the service immediately
-
-### Query String Data
-
-View current solar string status from InfluxDB:
-
-```bash
-python -m powerwall_service.string_status --env-file .env
-```
-
-Or use the shell wrapper:
-
-```bash
-./show-strings.sh
-```
-
-## Shell Aliases (Optional)
-
-Add these to your `~/.zshrc` or `~/.bashrc` for convenience:
-
-```bash
-# Powerwall InfluxDB service aliases
-alias pw-strings='cd ~/dev/powerwall-influx && python -m powerwall_service.string_status --env-file .env'
-alias pw-influx-once='cd ~/dev/powerwall-influx && python -m powerwall_service.influx_service --env-file .env --once'
-alias pw-influx='cd ~/dev/powerwall-influx && echo "🚀 Starting Powerwall InfluxDB service (Ctrl+C to stop)..." && python -m powerwall_service.influx_service --env-file .env'
-alias pw-connect='cd ~/dev/powerwall-influx && python -m powerwall_service.connect_wifi --env-file .env'
-
-pw-help() {
-  cat << 'EOF'
-Powerwall InfluxDB Service Commands:
-====================================
-pw-strings        - View current string status from InfluxDB
-pw-influx-once    - Test service with single poll
-pw-influx         - Run continuous service (foreground)
-pw-connect        - Connect to Powerwall Wi-Fi AP
-
-Systemd Service Commands:
-=========================
-sudo systemctl status powerwall-influx   - Check service status
-sudo systemctl start powerwall-influx    - Start service
-sudo systemctl stop powerwall-influx     - Stop service
-sudo systemctl restart powerwall-influx  - Restart service
-sudo journalctl -u powerwall-influx -f   - View live logs
-
-Configuration:
-=============
-Edit ~/dev/powerwall-influx/.env to change settings
-After editing, restart the service: sudo systemctl restart powerwall-influx
-EOF
-}
-```
-
-Then run `source ~/.zshrc` to activate.
-
-## Configuration
-
-The `.env` file supports these variables:
-
-### InfluxDB Settings
-
-```bash
-INFLUX_URL=http://influxdb.home:8086
-INFLUX_ORG=homeassistant
-INFLUX_BUCKET=powerwall
-INFLUX_TOKEN=your-token-here
-INFLUX_MEASUREMENT=powerwall
-INFLUX_TIMEOUT=10
-INFLUX_VERIFY_TLS=false
-```
-
-### Powerwall Settings
-
-```bash
-PW_HOST=192.168.91.1
-PW_TIMEZONE=America/New_York
-PW_CACHE_EXPIRE=5
-PW_REQUEST_TIMEOUT=10
-PW_POLL_INTERVAL=5  # Polling interval in seconds
-```
-
-### Credentials
-
-```bash
-PW_CUSTOMER_EMAIL=
-PW_CUSTOMER_PASSWORD=
-PW_GATEWAY_PASSWORD=your-gateway-password
-```
-
-### Wi-Fi Auto-Connect (Optional)
-
-```bash
-PW_CONNECT_WIFI=true
-PW_WIFI_SSID=TeslaPW_XXXXXX
-PW_WIFI_PASSWORD=your-wifi-password
-PW_WIFI_INTERFACE=wlp0s20f3
-```
-
-### Logging
-
-```bash
-PW_LOG_LEVEL=INFO  # DEBUG, INFO, WARNING, ERROR
-```
-
-## Metrics Exported
-
-### Power & Energy
-
-- `battery_power` - Battery charge/discharge power (W)
-- `site_power` - Grid import/export power (W)
-- `load_power` - Home consumption (W)
-- `solar_power` - Solar production (W)
-- `battery_soe` - State of energy (%)
-
-### Battery Details
-
-- `battery_blocks` - Number of battery blocks
-- `nominal_energy_remaining` - Remaining energy (Wh)
-- `nominal_full_pack_energy` - Total capacity (Wh)
-
-### Grid & Frequency
-
-- `grid_status` - Grid connection status
-- `island_status` - Backup mode status
-- `frequency` - Grid frequency (Hz)
-- `voltage_*` - Various voltage measurements
-
-### Solar Strings (A-F)
-
-For each string:
-- `string_X_connected` - Connection status (0/1)
-- `string_X_state` - Operating state
-- `string_X_voltage` - DC voltage (V)
-- `string_X_current` - DC current (A)
-- `string_X_power` - DC power (W)
-
-## Systemd Service Management
-
-### Check Status
-
-```bash
-sudo systemctl status powerwall-influx
-```
-
-### View Logs
-
-```bash
-# Live logs
-sudo journalctl -u powerwall-influx -f
-
-# Recent logs
-sudo journalctl -u powerwall-influx -n 100
-
-# Logs since last boot
-sudo journalctl -b -u powerwall-influx
-```
-
-### Control Service
-
-```bash
-sudo systemctl start powerwall-influx
-sudo systemctl stop powerwall-influx
 sudo systemctl restart powerwall-influx
 ```
 
-### Disable/Enable Autostart
+### Home Assistant discovery
+
+1. Enable MQTT as above.
+2. Check **Settings → Devices & Services → MQTT** for a *Powerwall* device; entities appear automatically via MQTT Discovery.
+3. If sensors do not appear, reload the MQTT integration or delete the old *Powerwall* device to trigger rediscovery.
+
+### Metric cheat sheet
+
+- Battery: `battery_percentage`, `battery_power_w`, `battery_nominal_energy_remaining_wh`
+- Solar / load: `solar_power_w`, `load_power_w`, `site_power_w`
+- Strings (`a`–`f`): `string_x_voltage_v`, `string_x_current_a`, `string_x_power_w`, `string_x_connected`, `string_x_state`
+
+Tune the output by setting `MQTT_METRICS=battery_percentage,solar_power_w,string_a_power_w` (or similar) in `.env`.
+
+### Useful commands
 
 ```bash
-sudo systemctl disable powerwall-influx  # Disable autostart
-sudo systemctl enable powerwall-influx   # Enable autostart
+sudo systemctl status powerwall-influx      # Service status
+sudo journalctl -u powerwall-influx -n 50   # Recent logs
+sudo journalctl -u powerwall-influx -f      # Follow live logs
+sudo journalctl -u powerwall-influx -n 20 | grep -i mqtt
 ```
 
-### Remove Service
+## API surface
 
-```bash
-sudo systemctl stop powerwall-influx
-sudo systemctl disable powerwall-influx
-sudo rm /etc/systemd/system/powerwall-influx.service
-sudo systemctl daemon-reload
-```
+| Method | Path | Description |
+| --- | --- | --- |
+| GET | `/` | Service banner |
+| GET | `/health` | Component health summary |
+| GET | `/config` | Redacted configuration |
+| GET | `/snapshot` | Latest stored poll |
+| GET | `/snapshot/live` | Immediate poll (`push_to_influx`, `publish_mqtt` query flags) |
+| POST | `/poll` | Manual poll (JSON body mirrors flags) |
+| GET | `/status` | Background task status |
 
 ## Troubleshooting
 
-### Service Won't Start
-
-1. Check logs: `sudo journalctl -u powerwall-influx -n 100`
-2. Test manually: `python -m powerwall_service.influx_service --env-file .env --once`
-3. Verify credentials in `.env`
-4. Check InfluxDB connectivity
-
-### No Data in InfluxDB
-
-1. Verify InfluxDB is running: `curl http://influxdb.home:8086/health`
-2. Check InfluxDB token is valid
-3. Verify bucket name matches
-4. Enable DEBUG logging: `PW_LOG_LEVEL=DEBUG` in `.env`
-
-### Wi-Fi Connection Issues
-
-1. Check NetworkManager is running: `systemctl status NetworkManager`
-2. Verify SSID and password in `.env`
-3. Test manually: `python -m powerwall_service.connect_wifi --env-file .env`
-4. Check Wi-Fi interface name: `ip link show`
-
-### String Data Not Showing
-
-String data is only available during daylight when solar is active. At night, all strings show 0V/0A/0W.
-
-## Project Structure
-
-```
-powerwall-influx/
-├── powerwall_service/
-│   ├── __init__.py           # Package initialization
-│   ├── connect_wifi.py       # Wi-Fi auto-connect helper
-│   ├── influx_service.py     # Main polling service
-│   └── string_status.py      # InfluxDB query tool
-├── .env.example              # Example configuration
-├── .env                      # Your configuration (not in git)
-├── requirements.txt          # Python dependencies
-├── README.md                 # This file
-├── install-service.sh        # Systemd service installer
-├── show-strings.sh           # Shell wrapper for string status
-└── powerwall-influx.service  # Systemd service file
-```
-
-## Credits
-
-Built with:
-- [pypowerwall](https://github.com/jasonacox/pypowerwall) - Tesla Powerwall API client
-- [InfluxDB](https://www.influxdata.com/) - Time series database
-- [requests](https://requests.readthedocs.io/) - HTTP library
+- **General diagnostics**
+   - Follow logs: `sudo journalctl -u powerwall-influx -f`
+   - Check connectivity: `ping $PW_HOST`, `curl $INFLUX_URL/health`
+   - Debug poll locally: `PW_LOG_LEVEL=DEBUG python -m powerwall_service.cli poll --pretty`
+- **Wi-Fi auto-connect**
+   - Requires NetworkManager (`nmcli`). If `PW_WIFI_INTERFACE` is not a Wi-Fi device the service will fall back to letting NM choose.
+   - Verify availability: `nmcli device wifi list`
+- **MQTT**
+   - Confirm broker reachability: `ping $MQTT_HOST`, `telnet $MQTT_HOST $MQTT_PORT`
+   - Ensure Home Assistant discovery prefix is `homeassistant` (default).
+   - Remove stale Powerwall devices in HA to trigger rediscovery.
 
 ## License
 
-MIT License - See LICENSE file for details
-
-## Contributing
-
-Contributions welcome! Please open an issue or PR.
-
-## Support
-
-For issues or questions:
-1. Check the troubleshooting section
-2. Enable DEBUG logging
-3. Review service logs
-4. Open an issue with logs and configuration (redact credentials!)
+MIT © Contributors

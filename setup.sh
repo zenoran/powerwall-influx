@@ -58,7 +58,7 @@ fi
 # Test the service
 echo ""
 echo "🧪 Testing service configuration..."
-if $PYTHON_CMD -m powerwall_service.influx_service --env-file .env --once; then
+if PW_LOG_LEVEL=INFO $PYTHON_CMD -m powerwall_service.cli poll --pretty; then
     echo ""
     echo "✅ Configuration test successful!"
 else
@@ -75,10 +75,10 @@ echo ""
 echo "Next steps:"
 echo ""
 echo "1. Test manually:"
-echo "   python -m powerwall_service.influx_service --env-file .env --once"
+echo "   python -m powerwall_service.cli poll --pretty"
 echo ""
-echo "2. Run continuously:"
-echo "   python -m powerwall_service.influx_service --env-file .env"
+echo "2. Run the HTTP service:"
+echo "   python -m powerwall_service.cli serve"
 echo ""
 echo "3. Install as systemd service:"
 echo "   ./install-service.sh"

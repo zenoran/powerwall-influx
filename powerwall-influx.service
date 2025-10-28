@@ -1,18 +1,6 @@
-[Unit]
-Description=Powerwall metrics to InfluxDB
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=nick
-WorkingDirectory=/home/nick/dev/powerwall-influx
-Environment="PATH=/home/nick/dev/global-venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-ExecStart=/home/nick/dev/global-venv/bin/python3 -m powerwall_service.influx_service --env-file .env
-Restart=on-failure
-RestartSec=30
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
+# This file is intentionally left blank.
+#
+# The install-service.sh script prompts for your environment details, renders
+# powerwall-influx.service.template, and writes the result to
+# powerwall-influx.service.local (which is gitignored). The generated unit file
+# is then copied into /etc/systemd/system during installation.

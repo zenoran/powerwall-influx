@@ -90,6 +90,16 @@ def _active_connection_name(interface: Optional[str]) -> Optional[str]:
     return None
 
 
+def _is_wifi_device(interface: str) -> bool:
+    proc = _run_nmcli(["-t", "-f", "GENERAL.TYPE", "device", "show", interface], check=False)
+    if proc.returncode != 0:
+        return False
+    for line in proc.stdout.splitlines():
+        if "wifi" in line.lower():
+            return True
+    return False
+
+
 def connect_to_wifi(ssid: str, password: Optional[str], interface: Optional[str], timeout: int) -> None:
     if _is_connected_to_ssid(ssid):
         LOGGER.info("Already connected to Wi-Fi SSID '%s'.", ssid)
@@ -99,7 +109,10 @@ def connect_to_wifi(ssid: str, password: Optional[str], interface: Optional[str]
     if password:
         args.extend(["password", password])
     if interface:
-        args.extend(["ifname", interface])
+        if _is_wifi_device(interface):
+            args.extend(["ifname", interface])
+        else:
+            LOGGER.warning("Interface '%s' is not a Wi-Fi device; letting NetworkManager pick automatically.", interface)
 
     proc = _run_nmcli(args, check=False)
     if proc.returncode != 0:

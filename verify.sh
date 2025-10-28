@@ -20,8 +20,9 @@ cd "$(dirname "$0")" || exit 1
 echo "📁 Checking files..."
 FILES=(
     "powerwall_service/__init__.py"
+    "powerwall_service/app.py"
+    "powerwall_service/cli.py"
     "powerwall_service/connect_wifi.py"
-    "powerwall_service/influx_service.py"
     "powerwall_service/string_status.py"
     ".env"
     ".env.example"
@@ -54,7 +55,7 @@ echo ""
 
 # Check dependencies
 echo "📦 Checking dependencies..."
-DEPS=("pypowerwall" "requests" "dotenv")
+DEPS=("pypowerwall" "requests" "dotenv" "fastapi" "uvicorn")
 for dep in "${DEPS[@]}"; do
     if python3 -c "import ${dep/python-/}" 2>/dev/null; then
         echo -e "  ${GREEN}✓${NC} $dep"
@@ -83,11 +84,12 @@ echo ""
 
 # Test service
 echo "🧪 Testing service..."
-if python3 -m powerwall_service.influx_service --env-file .env --once 2>&1 | grep -q "Wrote metrics"; then
-    echo -e "  ${GREEN}✓${NC} Service test successful"
+if python3 -m powerwall_service.cli poll --pretty >/tmp/powerwall_influx_verify.json 2>&1; then
+    echo -e "  ${GREEN}✓${NC} Service poll completed"
 else
-    echo -e "  ${YELLOW}⚠${NC} Service test failed (check logs above)"
+    echo -e "  ${YELLOW}⚠${NC} Service poll failed (check logs above)"
 fi
+rm -f /tmp/powerwall_influx_verify.json
 
 echo ""
 
@@ -134,7 +136,7 @@ echo "======================================="
 echo ""
 echo "Next steps:"
 echo "  • View string data: ./show-strings.sh"
-echo "  • Test service: python3 -m powerwall_service.influx_service --env-file .env --once"
+echo "  • Test poll: python3 -m powerwall_service.cli poll --pretty"
 echo "  • View logs: sudo journalctl -u powerwall-influx -f"
 echo "  • See full docs: cat README.md"
 echo ""

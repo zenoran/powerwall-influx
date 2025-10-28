@@ -14,7 +14,7 @@ First standalone release after extracting from pypowerwall repository.
 - **String Status Viewer**: Query and display per-string solar data from InfluxDB
 - **Systemd Integration**: Service file and installer for automatic startup on boot
 - **Configuration Management**: Environment-based configuration via `.env` file
-- **Comprehensive Documentation**: README, Quick Start, and Migration guides
+- **Comprehensive Documentation**: README and supporting references
 - **Verification Tool**: Script to verify installation and connectivity
 - **Shell Utilities**: Wrapper scripts for common operations
 
@@ -33,7 +33,6 @@ First standalone release after extracting from pypowerwall repository.
 #### Dependencies
 - `pypowerwall>=0.10.0` - Tesla Powerwall API client
 - `requests>=2.31.0` - HTTP library
-- `python-dotenv>=1.0.0` - Environment file support
 
 #### Installation
 - Automated setup script (`setup.sh`)
@@ -41,9 +40,7 @@ First standalone release after extracting from pypowerwall repository.
 - Support for virtual environments and system-wide installation
 
 #### Documentation
-- `README.md` - Complete project documentation
-- `QUICKSTART.md` - Quick migration guide from old structure
-- `MIGRATION.md` - Detailed migration summary
+- `README.md` - Complete project documentation (includes configuration, MQTT, troubleshooting)
 - `.env.example` - Example configuration with all options
 
 #### Scripts

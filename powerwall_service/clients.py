@@ -212,8 +212,7 @@ class InfluxWriter:
     def build_line(self, snapshot: Dict[str, object]) -> Optional[str]:
         measurement = self._escape(self._config.measurement)
         tags = {
-            "site": snapshot.get("site_name") or "unknown",
-            "firmware": snapshot.get("firmware") or "unknown",
+            "site": snapshot.get("site_name") or "unknown"
         }
         tags_part = ",".join(f"{self._escape(k)}={self._escape(str(v))}" for k, v in tags.items())
 

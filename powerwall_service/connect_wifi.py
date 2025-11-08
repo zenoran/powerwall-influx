@@ -100,11 +100,49 @@ def _is_wifi_device(interface: str) -> bool:
     return False
 
 
+def _find_connection_by_ssid(ssid: str) -> Optional[str]:
+    """Return the connection profile name for the given SSID, or None."""
+    proc = _run_nmcli(["-t", "-f", "NAME,TYPE", "connection", "show"], check=False)
+    if proc.returncode != 0:
+        return None
+    # Look for wifi connections and check if they match the SSID
+    for line in proc.stdout.splitlines():
+        if not line or ":wifi" not in line.lower():
+            continue
+        parts = line.split(":")
+        if len(parts) >= 2:
+            conn_name = parts[0]
+            # Check if this connection profile is for our SSID
+            detail_proc = _run_nmcli(["-t", "-f", "802-11-wireless.ssid", "connection", "show", conn_name], check=False)
+            if detail_proc.returncode == 0:
+                for detail_line in detail_proc.stdout.splitlines():
+                    if detail_line.strip() and ssid in detail_line:
+                        return conn_name
+    return None
+
+
 def connect_to_wifi(ssid: str, password: Optional[str], interface: Optional[str], timeout: int) -> None:
     if _is_connected_to_ssid(ssid):
         LOGGER.info("Already connected to Wi-Fi SSID '%s'.", ssid)
         return
 
+    # First try to activate existing connection profile
+    existing_connection = _find_connection_by_ssid(ssid)
+    if existing_connection:
+        LOGGER.info("Found existing connection profile '%s' for SSID '%s', attempting activation...", existing_connection, ssid)
+        proc = _run_nmcli(["connection", "up", existing_connection], check=False)
+        if proc.returncode == 0:
+            # Wait briefly to confirm connection
+            deadline = time.time() + min(timeout, 15)
+            while time.time() < deadline:
+                if _is_connected_to_ssid(ssid):
+                    LOGGER.info("Successfully activated existing connection '%s'.", existing_connection)
+                    return
+                time.sleep(1)
+        else:
+            LOGGER.debug("Failed to activate existing connection profile: %s", proc.stderr.strip())
+
+    # Fall back to creating new connection
     args: list[str] = ["device", "wifi", "connect", ssid]
     if password:
         args.extend(["password", password])

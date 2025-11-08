@@ -61,6 +61,7 @@ Async FastAPI service that polls a Tesla Powerwall gateway, writes metrics to In
 | Credentials | `PW_CUSTOMER_EMAIL`, `PW_CUSTOMER_PASSWORD`, `PW_GATEWAY_PASSWORD` | Provide whichever combination grants access. |
 | Wi-Fi (optional) | `PW_CONNECT_WIFI`, `PW_WIFI_SSID`, `PW_WIFI_PASSWORD`, `PW_WIFI_INTERFACE` | Requires NetworkManager for auto-association. |
 | MQTT (optional) | `MQTT_ENABLED`, `MQTT_HOST`, `MQTT_PORT=1883`, `MQTT_USERNAME`, `MQTT_PASSWORD`, `MQTT_TOPIC_PREFIX=homeassistant/sensor/powerwall`, `MQTT_QOS=1`, `MQTT_RETAIN=true`, `MQTT_METRICS=` | Leave `MQTT_METRICS` empty to publish all supported metrics. |
+| MQTT Health Monitoring | `MQTT_HEALTH_ENABLED=true`, `MQTT_HEALTH_HOST`, `MQTT_HEALTH_PORT`, `MQTT_HEALTH_USERNAME`, `MQTT_HEALTH_PASSWORD`, `MQTT_HEALTH_TOPIC_PREFIX=homeassistant/sensor/powerwall_health`, `MQTT_HEALTH_INTERVAL=60`, `MQTT_HEALTH_QOS=1` | Independent health monitoring; defaults to main MQTT settings. See [HEALTH_MONITORING.md](HEALTH_MONITORING.md) for details. |
 | Logging | `PW_LOG_LEVEL=INFO` | Use `DEBUG` for verbose troubleshooting. |
 
 Save changes and restart the service (or rerun the poll) after updating `.env`.
@@ -98,6 +99,32 @@ sudo systemctl restart powerwall-influx
 
 Tune the output by setting `MQTT_METRICS=battery_percentage,solar_power_w,string_a_power_w` (or similar) in `.env`.
 
+## Health Monitoring
+
+The service includes **independent health monitoring** that publishes service health metrics to MQTT for Home Assistant integration. This allows you to create automations that alert you when the service experiences issues.
+
+**Key features:**
+- **Resilient**: Health metrics publish even when Powerwall/InfluxDB are down
+- **Independent**: Separate MQTT connection and async task
+- **Auto-discovery**: Seamless Home Assistant integration
+- **Component tracking**: Individual health sensors for Powerwall, InfluxDB, MQTT, and WiFi
+
+Enable health monitoring in `.env`:
+
+```bash
+MQTT_HEALTH_ENABLED=true
+MQTT_HEALTH_HOST=mqtt.home          # Defaults to MQTT_HOST
+MQTT_HEALTH_PORT=1883                # Defaults to MQTT_PORT
+MQTT_HEALTH_USERNAME=your_user       # Defaults to MQTT_USERNAME
+MQTT_HEALTH_PASSWORD=your_pass       # Defaults to MQTT_PASSWORD
+```
+
+**📖 See [HEALTH_MONITORING.md](HEALTH_MONITORING.md) for complete documentation**, including:
+- Configuration options
+- Available sensors
+- Example Home Assistant automations
+- Troubleshooting
+
 ### Useful commands
 
 ```bash
@@ -128,8 +155,13 @@ sudo journalctl -u powerwall-influx -n 20 | grep -i mqtt
 - **Wi-Fi auto-connect**
    - Requires NetworkManager (`nmcli`). If `PW_WIFI_INTERFACE` is not a Wi-Fi device the service will fall back to letting NM choose.
    - Verify availability: `nmcli device wifi list`
+   - Check connection status: `nmcli connection show`
+   - If Wi-Fi drops, manually reconnect: `sudo nmcli connection up <SSID>` (e.g., `sudo nmcli connection up TeslaPW_XXXXXX`)
+   - The service now attempts to reactivate existing connection profiles before creating new ones, improving recovery from NetworkManager backoff states
 - **MQTT**
    - Confirm broker reachability: `ping $MQTT_HOST`, `telnet $MQTT_HOST $MQTT_PORT`
+   - Check for rapid connect/disconnect cycles: `sudo journalctl -u powerwall-influx -n 50 | grep -i mqtt`
+     - If you see repeated "Connected/Disconnected" messages, verify no duplicate services are running with the same client ID
    - Ensure Home Assistant discovery prefix is `homeassistant` (default).
    - Remove stale Powerwall devices in HA to trigger rediscovery.
 

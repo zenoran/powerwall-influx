@@ -43,6 +43,14 @@ class ServiceConfig:
     mqtt_qos: int
     mqtt_retain: bool
     mqtt_metrics: Set[str]
+    mqtt_health_enabled: bool
+    mqtt_health_host: str
+    mqtt_health_port: int
+    mqtt_health_username: Optional[str]
+    mqtt_health_password: Optional[str]
+    mqtt_health_topic_prefix: str
+    mqtt_health_interval: float
+    mqtt_health_qos: int
 
 
 def load_env_file(path: Path) -> None:
@@ -100,6 +108,13 @@ def build_config() -> ServiceConfig:
     if mqtt_metrics_raw:
         mqtt_metrics = {token.strip() for token in mqtt_metrics_raw.split(",") if token.strip()}
 
+    # Health monitoring defaults to same MQTT broker as main MQTT, but can be overridden
+    mqtt_health_enabled = _env_bool("MQTT_HEALTH_ENABLED", True)
+    mqtt_health_host = os.environ.get("MQTT_HEALTH_HOST") or os.environ.get("MQTT_HOST", "mqtt.home")
+    mqtt_health_port = _env_int("MQTT_HEALTH_PORT", 0) or _env_int("MQTT_PORT", 1883)
+    mqtt_health_username = os.environ.get("MQTT_HEALTH_USERNAME") or os.environ.get("MQTT_USERNAME")
+    mqtt_health_password = os.environ.get("MQTT_HEALTH_PASSWORD") or os.environ.get("MQTT_PASSWORD")
+
     cfg = ServiceConfig(
         influx_url=os.environ.get("INFLUX_URL", "http://influxdb.home:8086"),
         influx_org=os.environ.get("INFLUX_ORG", "home"),
@@ -130,6 +145,17 @@ def build_config() -> ServiceConfig:
         mqtt_qos=_env_int("MQTT_QOS", 1),
         mqtt_retain=_env_bool("MQTT_RETAIN", True),
         mqtt_metrics=mqtt_metrics,
+        mqtt_health_enabled=mqtt_health_enabled,
+        mqtt_health_host=mqtt_health_host,
+        mqtt_health_port=mqtt_health_port,
+        mqtt_health_username=mqtt_health_username,
+        mqtt_health_password=mqtt_health_password,
+        mqtt_health_topic_prefix=os.environ.get(
+            "MQTT_HEALTH_TOPIC_PREFIX",
+            "homeassistant/sensor/powerwall_health"
+        ),
+        mqtt_health_interval=_env_float("MQTT_HEALTH_INTERVAL", 60.0),
+        mqtt_health_qos=_env_int("MQTT_HEALTH_QOS", 1),
     )
 
     if not cfg.influx_token:
@@ -174,4 +200,12 @@ def redact_config(cfg: ServiceConfig) -> dict:
         "mqtt_qos": cfg.mqtt_qos,
         "mqtt_retain": cfg.mqtt_retain,
         "mqtt_metrics": sorted(cfg.mqtt_metrics),
+        "mqtt_health_enabled": cfg.mqtt_health_enabled,
+        "mqtt_health_host": cfg.mqtt_health_host,
+        "mqtt_health_port": cfg.mqtt_health_port,
+        "mqtt_health_username": cfg.mqtt_health_username,
+        "mqtt_health_password": REDACTED if cfg.mqtt_health_password else None,
+        "mqtt_health_topic_prefix": cfg.mqtt_health_topic_prefix,
+        "mqtt_health_interval": cfg.mqtt_health_interval,
+        "mqtt_health_qos": cfg.mqtt_health_qos,
     }

@@ -17,6 +17,7 @@ from .clients import (
     maybe_connect_wifi,
 )
 from .config import ServiceConfig
+from .health_monitor import HealthMonitor
 
 LOGGER = logging.getLogger("powerwall_service.service")
 
@@ -77,9 +78,29 @@ class PowerwallService:
         self._last_mqtt_error: Optional[str] = None
         self._last_influx_success: Optional[datetime] = None
         self._last_mqtt_success: Optional[datetime] = None
+        self._last_wifi_error: Optional[str] = None
 
         self._wifi_retry_seconds = 300
         self._last_wifi_attempt = 0.0
+        
+        # Initialize independent health monitor
+        self._health_monitor: Optional[HealthMonitor] = None
+        if config.mqtt_health_enabled:
+            try:
+                self._health_monitor = HealthMonitor(
+                    mqtt_host=config.mqtt_health_host,
+                    mqtt_port=config.mqtt_health_port,
+                    health_getter=self.get_health_report,
+                    mqtt_username=config.mqtt_health_username,
+                    mqtt_password=config.mqtt_health_password,
+                    topic_prefix=config.mqtt_health_topic_prefix,
+                    device_name="Powerwall Service",
+                    publish_interval=config.mqtt_health_interval,
+                    qos=config.mqtt_health_qos,
+                )
+            except Exception as exc:
+                LOGGER.error("Failed to initialize health monitor: %s", exc)
+                self._health_monitor = None
 
     # ------------------------------------------------------------------
     async def start(self) -> None:
@@ -87,6 +108,14 @@ class PowerwallService:
             return
         self._stop_event.clear()
         await asyncio.to_thread(self._maybe_join_wifi)
+        
+        # Start health monitor first so it can track service startup
+        if self._health_monitor:
+            try:
+                await self._health_monitor.start()
+            except Exception as exc:
+                LOGGER.error("Failed to start health monitor: %s", exc)
+        
         self._background_task = asyncio.create_task(self._run_loop(), name="powerwall-poller")
 
     async def stop(self) -> None:
@@ -103,6 +132,13 @@ class PowerwallService:
             self._background_task = None
             self._stop_event = asyncio.Event()
             await asyncio.to_thread(self._shutdown_clients)
+        
+        # Stop health monitor last so it can report final status
+        if self._health_monitor:
+            try:
+                await self._health_monitor.stop()
+            except Exception as exc:
+                LOGGER.error("Failed to stop health monitor: %s", exc)
 
     # ------------------------------------------------------------------
     async def poll_once(
@@ -171,6 +207,23 @@ class PowerwallService:
                 detail=None if not self._config.mqtt_enabled else "MQTT disabled",
                 last_success=self._last_mqtt_success,
                 last_error=self._last_mqtt_error,
+            )
+
+        if self._config.connect_wifi:
+            components["wifi"] = ComponentHealth(
+                name="wifi",
+                healthy=self._last_wifi_error is None,
+                detail=None if self._last_wifi_error is None else self._last_wifi_error,
+                last_success=None,  # Not tracking success time
+                last_error=self._last_wifi_error,
+            )
+        else:
+            components["wifi"] = ComponentHealth(
+                name="wifi",
+                healthy=True,
+                detail="Wi-Fi auto-connect disabled",
+                last_success=None,
+                last_error=None,
             )
 
         overall = all(component.healthy for component in components.values())
@@ -292,7 +345,9 @@ class PowerwallService:
             if now - self._last_wifi_attempt >= self._wifi_retry_seconds:
                 try:
                     maybe_connect_wifi(self._config)
+                    self._last_wifi_error = None  # Success
                 except Exception as exc:  # pragma: no cover - environment dependent
+                    self._last_wifi_error = str(exc)
                     LOGGER.warning("Wi-Fi reconnection attempt failed: %s", exc)
                 finally:
                     self._last_wifi_attempt = time.monotonic()
@@ -300,7 +355,9 @@ class PowerwallService:
     def _maybe_join_wifi(self) -> None:
         try:
             maybe_connect_wifi(self._config)
+            self._last_wifi_error = None
         except Exception as exc:
+            self._last_wifi_error = str(exc)
             LOGGER.warning("Initial Wi-Fi connection failed: %s", exc)
 
     def _shutdown_clients(self) -> None:

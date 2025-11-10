@@ -60,12 +60,40 @@ def _is_connection_error(exc: BaseException) -> bool:
     return False
 
 
+def _is_auth_error(exc: BaseException) -> bool:
+    """Return ``True`` if ``exc`` represents an authentication failure (403/401)."""
+    
+    # Check if it's an HTTP error with 403 or 401 status
+    if isinstance(exc, requests_exceptions.HTTPError):
+        if hasattr(exc, 'response') and exc.response is not None:
+            return exc.response.status_code in (401, 403)
+    
+    # Check exception message for authentication indicators
+    exc_str = str(exc).lower()
+    auth_indicators = ['403', '401', 'forbidden', 'unauthorized', 'authentication']
+    if any(indicator in exc_str for indicator in auth_indicators):
+        return True
+    
+    # Check nested exceptions
+    cause = getattr(exc, "__cause__", None)
+    if cause and cause is not exc and _is_auth_error(cause):
+        return True
+    
+    context = getattr(exc, "__context__", None)
+    if context and context is not exc and _is_auth_error(context):
+        return True
+    
+    return False
+
+
 class PowerwallPoller:
     """Thin wrapper around :mod:`pypowerwall` with connection caching."""
 
     def __init__(self, config: ServiceConfig) -> None:
         self._config = config
         self._powerwall: Optional[pypowerwall.Powerwall] = None
+        self._consecutive_auth_failures = 0
+        self._max_auth_failures = 3  # Force full reconnect after this many 403s
 
     def close(self) -> None:
         if self._powerwall and getattr(self._powerwall, "client", None):
@@ -74,11 +102,24 @@ class PowerwallPoller:
             except Exception as exc:  # pragma: no cover - best effort cleanup
                 LOGGER.debug("Failed to close Powerwall session: %s", exc)
         self._powerwall = None
+        self._consecutive_auth_failures = 0
 
-    def _ensure_connection(self) -> None:
-        if self._powerwall and self._powerwall.is_connected():
+    def _ensure_connection(self, force_reconnect: bool = False) -> None:
+        """Ensure we have a valid connection to the Powerwall.
+        
+        Args:
+            force_reconnect: If True, close existing connection and create a new one
+        """
+        if force_reconnect:
+            LOGGER.info("Forcing full reconnection to Powerwall (auth failures: %d)", 
+                       self._consecutive_auth_failures)
+            self.close()
+        elif self._powerwall and self._powerwall.is_connected():
             return
-        self.close()
+        
+        if not self._powerwall:
+            self.close()  # Ensure clean state
+            
         gw_pwd = (
             self._config.gateway_password
             or self._config.wifi_password
@@ -103,6 +144,8 @@ class PowerwallPoller:
                 auto_select=True,
                 retry_modes=True,
             )
+            # Reset auth failure counter on successful connection
+            self._consecutive_auth_failures = 0
         except Exception as exc:
             if _is_connection_error(exc):
                 raise PowerwallUnavailableError(
@@ -111,43 +154,99 @@ class PowerwallPoller:
             raise
 
     def fetch_snapshot(self) -> Dict[str, object]:
+        """Fetch a complete snapshot of Powerwall metrics.
+        
+        This method implements robust error handling:
+        - Detects network failures and raises PowerwallUnavailableError
+        - Detects authentication failures and forces reconnection after threshold
+        - Automatically retries with full session recreation on auth errors
+        
+        Returns:
+            Dictionary containing all Powerwall metrics
+            
+        Raises:
+            PowerwallUnavailableError: When the Powerwall is unreachable or auth fails repeatedly
+        """
+        # Check if we need to force reconnect due to repeated auth failures
+        force_reconnect = self._consecutive_auth_failures >= self._max_auth_failures
+        
         try:
-            self._ensure_connection()
+            self._ensure_connection(force_reconnect=force_reconnect)
             assert self._powerwall is not None
             powerwall = self._powerwall
 
+            # Fetch power metrics with error handling
             try:
                 power_values = powerwall.power()
             except Exception as exc:
-                if _is_connection_error(exc):
+                if _is_auth_error(exc):
+                    self._consecutive_auth_failures += 1
+                    LOGGER.warning(
+                        "Authentication error fetching power metrics (failure %d/%d): %s",
+                        self._consecutive_auth_failures,
+                        self._max_auth_failures,
+                        exc,
+                    )
+                    # Try one more time with forced reconnection if we haven't exceeded threshold
+                    if self._consecutive_auth_failures < self._max_auth_failures:
+                        LOGGER.info("Attempting reconnection to recover from auth error")
+                        self.close()
+                        self._ensure_connection(force_reconnect=True)
+                        powerwall = self._powerwall
+                        power_values = powerwall.power()
+                    else:
+                        raise PowerwallUnavailableError(
+                            f"Authentication failed {self._consecutive_auth_failures} times, "
+                            f"unable to authenticate with Powerwall at {self._config.host}"
+                        ) from exc
+                elif _is_connection_error(exc):
                     raise PowerwallUnavailableError(
                         f"Unable to retrieve power metrics from Powerwall at {self._config.host}"
                     ) from exc
-                LOGGER.debug("power() failed; skipping aggregates this cycle: %s", exc)
-                power_values = None
+                else:
+                    LOGGER.debug("power() failed; skipping aggregates this cycle: %s", exc)
+                    power_values = None
 
+            # Build basic snapshot
             snapshot = {
                 "timestamp": datetime.now(timezone.utc),
-                "site_name": powerwall.site_name(),
-                "firmware": powerwall.version(),
-                "din": powerwall.din(),
-                "battery_percentage": powerwall.level(),
+                "site_name": self._safe_call(powerwall.site_name),
+                "firmware": self._safe_call(powerwall.version),
+                "din": self._safe_call(powerwall.din),
+                "battery_percentage": self._safe_call(powerwall.level),
                 "power": power_values,
-                "grid_status": powerwall.grid_status("string")
-                if hasattr(powerwall, "grid_status")
-                else None,
+                "grid_status": self._safe_call(
+                    lambda: powerwall.grid_status("string") if hasattr(powerwall, "grid_status") else None
+                ),
             }
 
+            # Fetch status with error handling
             try:
                 status = powerwall.status()
             except Exception as exc:
-                if _is_connection_error(exc):
+                if _is_auth_error(exc):
+                    self._consecutive_auth_failures += 1
+                    LOGGER.warning(
+                        "Authentication error fetching status (failure %d/%d): %s",
+                        self._consecutive_auth_failures,
+                        self._max_auth_failures,
+                        exc,
+                    )
+                    if self._consecutive_auth_failures >= self._max_auth_failures:
+                        raise PowerwallUnavailableError(
+                            f"Authentication failed {self._consecutive_auth_failures} times, "
+                            f"unable to authenticate with Powerwall at {self._config.host}"
+                        ) from exc
+                    status = None
+                elif _is_connection_error(exc):
                     raise PowerwallUnavailableError(
                         f"Unable to retrieve status from Powerwall at {self._config.host}"
                     ) from exc
-                LOGGER.debug("Unable to fetch status(): %s", exc)
-                status = None
+                else:
+                    LOGGER.debug("Unable to fetch status(): %s", exc)
+                    status = None
 
+            # Process status data
             if isinstance(status, dict):
                 alerts = status.get("control", {}).get("alerts", {}).get("active", [])
                 snapshot["alerts"] = alerts
@@ -157,16 +256,33 @@ class PowerwallPoller:
             else:
                 snapshot["alerts"] = []
 
+            # Fetch vitals with error handling
             try:
                 vitals = powerwall.vitals()
             except Exception as exc:
-                if _is_connection_error(exc):
+                if _is_auth_error(exc):
+                    self._consecutive_auth_failures += 1
+                    LOGGER.warning(
+                        "Authentication error fetching vitals (failure %d/%d): %s",
+                        self._consecutive_auth_failures,
+                        self._max_auth_failures,
+                        exc,
+                    )
+                    if self._consecutive_auth_failures >= self._max_auth_failures:
+                        raise PowerwallUnavailableError(
+                            f"Authentication failed {self._consecutive_auth_failures} times, "
+                            f"unable to authenticate with Powerwall at {self._config.host}"
+                        ) from exc
+                    vitals = None
+                elif _is_connection_error(exc):
                     raise PowerwallUnavailableError(
                         f"Unable to retrieve vitals from Powerwall at {self._config.host}"
                     ) from exc
-                LOGGER.debug("Unable to fetch vitals(): %s", exc)
-                vitals = None
+                else:
+                    LOGGER.debug("Unable to fetch vitals(): %s", exc)
+                    vitals = None
 
+            # Process vitals data
             if isinstance(vitals, dict):
                 snapshot["vitals"] = vitals
                 snapshot["battery_nominal_energy_remaining"] = _extract_float(
@@ -177,17 +293,40 @@ class PowerwallPoller:
                     vitals,
                     ["TEPOD--%s" % snapshot["din"], "POD_nom_full_pack_energy"],
                 )
+            
+            # Success! Reset auth failure counter
+            if self._consecutive_auth_failures > 0:
+                LOGGER.info("Successfully recovered from previous auth failures")
+                self._consecutive_auth_failures = 0
+            
             return snapshot
+            
         except PowerwallUnavailableError:
+            # Already a PowerwallUnavailableError, just close and re-raise
             self.close()
             raise
         except Exception as exc:
+            # Unexpected error - check if it's connection-related
             if _is_connection_error(exc):
                 self.close()
                 raise PowerwallUnavailableError(
                     f"Unable to communicate with Powerwall gateway at {self._config.host}"
                 ) from exc
+            elif _is_auth_error(exc):
+                self._consecutive_auth_failures += 1
+                self.close()
+                raise PowerwallUnavailableError(
+                    f"Authentication failed with Powerwall at {self._config.host}"
+                ) from exc
             raise
+
+    def _safe_call(self, func, default=None):
+        """Safely call a function, returning default on any exception."""
+        try:
+            return func()
+        except Exception as exc:
+            LOGGER.debug("Safe call failed: %s", exc)
+            return default
 
 
 class InfluxWriter:

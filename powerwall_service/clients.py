@@ -94,6 +94,8 @@ class PowerwallPoller:
         self._powerwall: Optional[pypowerwall.Powerwall] = None
         self._consecutive_auth_failures = 0
         self._max_auth_failures = 3  # Force full reconnect after this many 403s
+        self._consecutive_connection_failures = 0
+        self._max_connection_failures = 2  # Don't retry connection creation too many times
 
     def close(self) -> None:
         if self._powerwall and getattr(self._powerwall, "client", None):
@@ -103,6 +105,7 @@ class PowerwallPoller:
                 LOGGER.debug("Failed to close Powerwall session: %s", exc)
         self._powerwall = None
         self._consecutive_auth_failures = 0
+        # Don't reset connection failures here - we want to track them across close/reopen
 
     def _ensure_connection(self, force_reconnect: bool = False) -> None:
         """Ensure we have a valid connection to the Powerwall.
@@ -119,6 +122,17 @@ class PowerwallPoller:
         
         if not self._powerwall:
             self.close()  # Ensure clean state
+        
+        # Don't retry connection creation if we've failed too many times recently
+        if self._consecutive_connection_failures >= self._max_connection_failures:
+            LOGGER.debug(
+                "Skipping connection attempt (%d consecutive failures). Will retry on next poll.",
+                self._consecutive_connection_failures
+            )
+            raise PowerwallUnavailableError(
+                f"Too many consecutive connection failures ({self._consecutive_connection_failures}). "
+                f"Powerwall at {self._config.host} may be offline."
+            )
             
         gw_pwd = (
             self._config.gateway_password
@@ -127,12 +141,20 @@ class PowerwallPoller:
         )
         email = self._config.customer_email or "nobody@nowhere.com"
         password = self._config.customer_password or ""
+        
+        # Determine connection mode based on configuration
+        # If we have gw_pwd, use local mode with TEDAPI
+        # Don't use auto_select to avoid trying cloud/fleetapi modes we haven't configured
+        use_local_mode = bool(self._config.host)
+        
         LOGGER.debug(
-            "Connecting to Powerwall host=%s email=%s auto_select=True",
+            "Connecting to Powerwall host=%s email=%s mode=%s (fast-fail)",
             self._config.host,
             email,
+            "local" if use_local_mode else "cloud",
         )
         try:
+            # Disable auto_select and retry_modes to fail fast and avoid trying unconfigured modes
             self._powerwall = pypowerwall.Powerwall(
                 host=self._config.host,
                 password=password,
@@ -141,12 +163,27 @@ class PowerwallPoller:
                 pwcacheexpire=self._config.cache_expire,
                 timeout=self._config.request_timeout,
                 gw_pwd=gw_pwd,
-                auto_select=True,
-                retry_modes=True,
+                cloudmode=not use_local_mode,  # Only use cloud if no host specified
+                auto_select=False,  # Changed: Don't auto-select modes, be explicit
+                retry_modes=False,  # Changed: Don't let pypowerwall retry - we handle it
             )
-            # Reset auth failure counter on successful connection
+            # Success! Reset both failure counters
+            if self._consecutive_connection_failures > 0 or self._consecutive_auth_failures > 0:
+                LOGGER.info(
+                    "Successfully connected to Powerwall after %d connection failures, %d auth failures",
+                    self._consecutive_connection_failures,
+                    self._consecutive_auth_failures
+                )
             self._consecutive_auth_failures = 0
+            self._consecutive_connection_failures = 0
         except Exception as exc:
+            self._consecutive_connection_failures += 1
+            LOGGER.warning(
+                "Connection attempt failed (%d/%d): %s",
+                self._consecutive_connection_failures,
+                self._max_connection_failures,
+                exc
+            )
             if _is_connection_error(exc):
                 raise PowerwallUnavailableError(
                     f"Failed to connect to Powerwall gateway at {self._config.host}"

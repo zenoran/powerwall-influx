@@ -320,9 +320,24 @@ class PowerwallService:
             self._last_success_at = result.timestamp
             self._consecutive_failures = 0
             self._last_powerwall_error = None
+            # Reset connection failure counter on successful poll
+            if hasattr(self._poller, '_consecutive_connection_failures'):
+                if self._poller._consecutive_connection_failures > 0:
+                    LOGGER.debug("Resetting connection failure counter after successful poll")
+                self._poller._consecutive_connection_failures = 0
         else:
             self._consecutive_failures += 1
             self._last_powerwall_error = result.powerwall_error
+            
+            # After several consecutive failures, give the connection a chance to retry
+            # by resetting the connection failure counter
+            if self._consecutive_failures >= 5 and hasattr(self._poller, '_consecutive_connection_failures'):
+                if self._poller._consecutive_connection_failures > 0:
+                    LOGGER.info(
+                        "Resetting connection failure counter after %d poll failures to allow retry",
+                        self._consecutive_failures
+                    )
+                    self._poller._consecutive_connection_failures = 0
 
         if result.pushed_influx:
             self._last_influx_success = result.timestamp

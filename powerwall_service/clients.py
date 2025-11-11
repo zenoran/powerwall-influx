@@ -6,7 +6,7 @@ import logging
 import math
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Callable, Dict, Iterable, Optional
 
 import pypowerwall
 import requests
@@ -35,55 +35,65 @@ class PowerwallUnavailableError(RuntimeError):
     """Raised when the Powerwall gateway cannot be reached."""
 
 
+def _check_exception_chain(exc: BaseException, condition: Callable[[BaseException], bool]) -> bool:
+    """Walk the exception chain and check if any exception matches the condition.
+    
+    This helper reduces duplication between _is_connection_error() and _is_auth_error()
+    by providing a generic way to recursively check exception chains.
+    
+    Args:
+        exc: The exception to check
+        condition: A function that returns True if an exception matches
+        
+    Returns:
+        True if exc or any exception in its chain matches the condition
+    """
+    if condition(exc):
+        return True
+    
+    # Check __cause__ chain
+    cause = getattr(exc, "__cause__", None)
+    if cause and cause is not exc and _check_exception_chain(cause, condition):
+        return True
+    
+    # Check __context__ chain
+    context = getattr(exc, "__context__", None)
+    if context and context is not exc and _check_exception_chain(context, condition):
+        return True
+    
+    return False
+
+
 def _is_connection_error(exc: BaseException) -> bool:
     """Return ``True`` if ``exc`` (or its causes) represent a network failure."""
-
-    if isinstance(
-        exc,
-        (
-            requests_exceptions.RequestException,
-            urllib3_exceptions.HTTPError,
-            ConnectionError,
-            OSError,
-        ),
-    ):
-        return True
-
-    cause = getattr(exc, "__cause__", None)
-    if cause and cause is not exc and _is_connection_error(cause):
-        return True
-
-    context = getattr(exc, "__context__", None)
-    if context and context is not exc and _is_connection_error(context):
-        return True
-
-    return False
+    def is_network_exception(e: BaseException) -> bool:
+        return isinstance(
+            e,
+            (
+                requests_exceptions.RequestException,
+                urllib3_exceptions.HTTPError,
+                ConnectionError,
+                OSError,
+            ),
+        )
+    
+    return _check_exception_chain(exc, is_network_exception)
 
 
 def _is_auth_error(exc: BaseException) -> bool:
     """Return ``True`` if ``exc`` represents an authentication failure (403/401)."""
+    def is_auth_exception(e: BaseException) -> bool:
+        # Check if it's an HTTP error with 403 or 401 status
+        if isinstance(e, requests_exceptions.HTTPError):
+            if hasattr(e, 'response') and e.response is not None:
+                return e.response.status_code in (401, 403)
+        
+        # Check exception message for authentication indicators
+        exc_str = str(e).lower()
+        auth_indicators = ['403', '401', 'forbidden', 'unauthorized', 'authentication']
+        return any(indicator in exc_str for indicator in auth_indicators)
     
-    # Check if it's an HTTP error with 403 or 401 status
-    if isinstance(exc, requests_exceptions.HTTPError):
-        if hasattr(exc, 'response') and exc.response is not None:
-            return exc.response.status_code in (401, 403)
-    
-    # Check exception message for authentication indicators
-    exc_str = str(exc).lower()
-    auth_indicators = ['403', '401', 'forbidden', 'unauthorized', 'authentication']
-    if any(indicator in exc_str for indicator in auth_indicators):
-        return True
-    
-    # Check nested exceptions
-    cause = getattr(exc, "__cause__", None)
-    if cause and cause is not exc and _is_auth_error(cause):
-        return True
-    
-    context = getattr(exc, "__context__", None)
-    if context and context is not exc and _is_auth_error(context):
-        return True
-    
-    return False
+    return _check_exception_chain(exc, is_auth_exception)
 
 
 class PowerwallPoller:
@@ -219,6 +229,142 @@ class PowerwallPoller:
                 ) from exc
             raise
 
+    def _fetch_with_auth_retry(
+        self, 
+        fetch_func: Callable[[], Any], 
+        data_type: str
+    ) -> Any:
+        """Fetch data with authentication error handling and retry logic.
+        
+        This helper reduces duplication in fetch_snapshot() by centralizing
+        the auth error handling pattern used for power, status, and vitals.
+        
+        Args:
+            fetch_func: Function to call to fetch the data
+            data_type: Description of data being fetched (for logging)
+            
+        Returns:
+            The fetched data, or None if a recoverable error occurs
+            
+        Raises:
+            PowerwallUnavailableError: If auth fails repeatedly or connection fails
+        """
+        try:
+            return fetch_func()
+        except Exception as exc:
+            if _is_auth_error(exc):
+                self._consecutive_auth_failures += 1
+                LOGGER.warning(
+                    "Authentication error fetching %s (failure %d/%d): %s",
+                    data_type,
+                    self._consecutive_auth_failures,
+                    self._max_auth_failures,
+                    exc,
+                )
+                if self._consecutive_auth_failures >= self._max_auth_failures:
+                    raise PowerwallUnavailableError(
+                        f"Authentication failed {self._consecutive_auth_failures} times, "
+                        f"unable to authenticate with Powerwall at {self._config.host}"
+                    ) from exc
+                return None
+            elif _is_connection_error(exc):
+                raise PowerwallUnavailableError(
+                    f"Unable to retrieve {data_type} from Powerwall at {self._config.host}"
+                ) from exc
+            else:
+                LOGGER.debug("Failed to fetch %s: %s", data_type, exc)
+                return None
+
+    def _fetch_power_metrics(self) -> Optional[Dict[str, float]]:
+        """Fetch power metrics with auth retry logic."""
+        assert self._powerwall is not None
+        power_values = self._fetch_with_auth_retry(
+            self._powerwall.power,
+            "power metrics"
+        )
+        
+        # If auth failed once, try reconnecting
+        if power_values is None and self._consecutive_auth_failures > 0:
+            if self._consecutive_auth_failures < self._max_auth_failures:
+                LOGGER.info("Attempting reconnection to recover from auth error")
+                self.close()
+                self._ensure_connection(force_reconnect=True)
+                power_values = self._powerwall.power()
+        
+        return power_values
+
+    def _fetch_status_data(self) -> Optional[Dict[str, Any]]:
+        """Fetch status data with auth retry logic."""
+        assert self._powerwall is not None
+        return self._fetch_with_auth_retry(
+            self._powerwall.status,
+            "status"
+        )
+
+    def _fetch_vitals_data(self) -> Optional[Dict[str, Any]]:
+        """Fetch vitals data with auth retry logic."""
+        assert self._powerwall is not None
+        return self._fetch_with_auth_retry(
+            self._powerwall.vitals,
+            "vitals"
+        )
+
+    def _build_snapshot(
+        self,
+        power_values: Optional[Dict[str, float]],
+        status: Optional[Dict[str, Any]],
+        vitals: Optional[Dict[str, Any]]
+    ) -> Dict[str, object]:
+        """Build snapshot dictionary from fetched data.
+        
+        Args:
+            power_values: Power metrics from powerwall.power()
+            status: Status dict from powerwall.status()
+            vitals: Vitals dict from powerwall.vitals()
+            
+        Returns:
+            Complete snapshot dictionary
+        """
+        assert self._powerwall is not None
+        powerwall = self._powerwall
+        
+        # Build basic snapshot
+        snapshot = {
+            "timestamp": datetime.now(timezone.utc),
+            "site_name": self._safe_call(powerwall.site_name),
+            "firmware": self._safe_call(powerwall.version),
+            "din": self._safe_call(powerwall.din),
+            "battery_percentage": self._safe_call(powerwall.level),
+            "power": power_values,
+            "grid_status": self._safe_call(
+                lambda: powerwall.grid_status("string") if hasattr(powerwall, "grid_status") else None
+            ),
+        }
+
+        # Process status data
+        if isinstance(status, dict):
+            alerts = status.get("control", {}).get("alerts", {}).get("active", [])
+            snapshot["alerts"] = alerts
+            system_status = status.get("control", {}).get("systemStatus", {})
+            if system_status:
+                snapshot["system_status"] = system_status
+        else:
+            snapshot["alerts"] = []
+
+        # Process vitals data
+        if isinstance(vitals, dict):
+            snapshot["vitals"] = vitals
+            snapshot["battery_nominal_energy_remaining"] = _extract_float(
+                vitals,
+                ["TEPOD--%s" % snapshot["din"], "POD_nom_energy_remaining"],
+            )
+            snapshot["battery_nominal_full_energy"] = _extract_float(
+                vitals,
+                ["TEPOD--%s" % snapshot["din"], "POD_nom_full_pack_energy"],
+            )
+        
+        return snapshot
+
     def fetch_snapshot(self) -> Dict[str, object]:
         """Fetch a complete snapshot of Powerwall metrics.
         
@@ -239,126 +385,14 @@ class PowerwallPoller:
         try:
             self._ensure_connection(force_reconnect=force_reconnect)
             assert self._powerwall is not None
-            powerwall = self._powerwall
 
-            # Fetch power metrics with error handling
-            try:
-                power_values = powerwall.power()
-            except Exception as exc:
-                if _is_auth_error(exc):
-                    self._consecutive_auth_failures += 1
-                    LOGGER.warning(
-                        "Authentication error fetching power metrics (failure %d/%d): %s",
-                        self._consecutive_auth_failures,
-                        self._max_auth_failures,
-                        exc,
-                    )
-                    # Try one more time with forced reconnection if we haven't exceeded threshold
-                    if self._consecutive_auth_failures < self._max_auth_failures:
-                        LOGGER.info("Attempting reconnection to recover from auth error")
-                        self.close()
-                        self._ensure_connection(force_reconnect=True)
-                        powerwall = self._powerwall
-                        power_values = powerwall.power()
-                    else:
-                        raise PowerwallUnavailableError(
-                            f"Authentication failed {self._consecutive_auth_failures} times, "
-                            f"unable to authenticate with Powerwall at {self._config.host}"
-                        ) from exc
-                elif _is_connection_error(exc):
-                    raise PowerwallUnavailableError(
-                        f"Unable to retrieve power metrics from Powerwall at {self._config.host}"
-                    ) from exc
-                else:
-                    LOGGER.debug("power() failed; skipping aggregates this cycle: %s", exc)
-                    power_values = None
+            # Fetch all data using helper methods
+            power_values = self._fetch_power_metrics()
+            status = self._fetch_status_data()
+            vitals = self._fetch_vitals_data()
 
-            # Build basic snapshot
-            snapshot = {
-                "timestamp": datetime.now(timezone.utc),
-                "site_name": self._safe_call(powerwall.site_name),
-                "firmware": self._safe_call(powerwall.version),
-                "din": self._safe_call(powerwall.din),
-                "battery_percentage": self._safe_call(powerwall.level),
-                "power": power_values,
-                "grid_status": self._safe_call(
-                    lambda: powerwall.grid_status("string") if hasattr(powerwall, "grid_status") else None
-                ),
-            }
-
-            # Fetch status with error handling
-            try:
-                status = powerwall.status()
-            except Exception as exc:
-                if _is_auth_error(exc):
-                    self._consecutive_auth_failures += 1
-                    LOGGER.warning(
-                        "Authentication error fetching status (failure %d/%d): %s",
-                        self._consecutive_auth_failures,
-                        self._max_auth_failures,
-                        exc,
-                    )
-                    if self._consecutive_auth_failures >= self._max_auth_failures:
-                        raise PowerwallUnavailableError(
-                            f"Authentication failed {self._consecutive_auth_failures} times, "
-                            f"unable to authenticate with Powerwall at {self._config.host}"
-                        ) from exc
-                    status = None
-                elif _is_connection_error(exc):
-                    raise PowerwallUnavailableError(
-                        f"Unable to retrieve status from Powerwall at {self._config.host}"
-                    ) from exc
-                else:
-                    LOGGER.debug("Unable to fetch status(): %s", exc)
-                    status = None
-
-            # Process status data
-            if isinstance(status, dict):
-                alerts = status.get("control", {}).get("alerts", {}).get("active", [])
-                snapshot["alerts"] = alerts
-                system_status = status.get("control", {}).get("systemStatus", {})
-                if system_status:
-                    snapshot["system_status"] = system_status
-            else:
-                snapshot["alerts"] = []
-
-            # Fetch vitals with error handling
-            try:
-                vitals = powerwall.vitals()
-            except Exception as exc:
-                if _is_auth_error(exc):
-                    self._consecutive_auth_failures += 1
-                    LOGGER.warning(
-                        "Authentication error fetching vitals (failure %d/%d): %s",
-                        self._consecutive_auth_failures,
-                        self._max_auth_failures,
-                        exc,
-                    )
-                    if self._consecutive_auth_failures >= self._max_auth_failures:
-                        raise PowerwallUnavailableError(
-                            f"Authentication failed {self._consecutive_auth_failures} times, "
-                            f"unable to authenticate with Powerwall at {self._config.host}"
-                        ) from exc
-                    vitals = None
-                elif _is_connection_error(exc):
-                    raise PowerwallUnavailableError(
-                        f"Unable to retrieve vitals from Powerwall at {self._config.host}"
-                    ) from exc
-                else:
-                    LOGGER.debug("Unable to fetch vitals(): %s", exc)
-                    vitals = None
-
-            # Process vitals data
-            if isinstance(vitals, dict):
-                snapshot["vitals"] = vitals
-                snapshot["battery_nominal_energy_remaining"] = _extract_float(
-                    vitals,
-                    ["TEPOD--%s" % snapshot["din"], "POD_nom_energy_remaining"],
-                )
-                snapshot["battery_nominal_full_energy"] = _extract_float(
-                    vitals,
-                    ["TEPOD--%s" % snapshot["din"], "POD_nom_full_pack_energy"],
-                )
+            # Build and return snapshot
+            snapshot = self._build_snapshot(power_values, status, vitals)
             
             # Success! Reset auth failure counter
             if self._consecutive_auth_failures > 0:
@@ -415,6 +449,11 @@ class InfluxWriter:
         return value.replace("\\", "\\\\").replace("\"", "\\\"")
 
     def build_line(self, snapshot: Dict[str, object]) -> Optional[str]:
+        """Build an InfluxDB line protocol string from a snapshot.
+        
+        Uses the shared extract_snapshot_metrics() function to parse the snapshot,
+        then formats the metrics into InfluxDB line protocol.
+        """
         measurement = self._escape(self._config.measurement)
         tags = {
             "site": snapshot.get("site_name") or "unknown"
@@ -438,74 +477,10 @@ class InfluxWriter:
             else:
                 fields_parts.append(f"{key}=\"{self._escape_str_field(str(value))}\"")
 
-        add_field("battery_percentage", _as_float(snapshot.get("battery_percentage")))
-        power = snapshot.get("power")
-        if isinstance(power, dict):
-            add_field("site_power_w", _as_float(power.get("site")))
-            add_field("solar_power_w", _as_float(power.get("solar")))
-            add_field("battery_power_w", _as_float(power.get("battery")))
-            add_field("load_power_w", _as_float(power.get("load")))
-        add_field(
-            "battery_nominal_energy_remaining_wh",
-            _as_float(snapshot.get("battery_nominal_energy_remaining")),
-        )
-        add_field(
-            "battery_nominal_full_energy_wh",
-            _as_float(snapshot.get("battery_nominal_full_energy")),
-        )
-        alerts = snapshot.get("alerts")
-        if isinstance(alerts, list):
-            add_field("alerts_count", len(alerts))
-            if alerts:
-                add_field("alerts", ";".join(sorted(str(a) for a in alerts)))
-        add_field("grid_status", snapshot.get("grid_status"))
-        add_field("din", snapshot.get("din"))
-
-        vitals = snapshot.get("vitals")
-        if isinstance(vitals, dict):
-            din = snapshot.get("din")
-            if din:
-                pvs_key = f"PVS--{din}"
-                if pvs_key in vitals:
-                    pvs = vitals[pvs_key]
-                    for string_name in [
-                        "StringA",
-                        "StringB",
-                        "StringC",
-                        "StringD",
-                        "StringE",
-                        "StringF",
-                    ]:
-                        key = f"PVS_{string_name}_Connected"
-                        if key in pvs:
-                            add_field(f"string_{string_name.lower()}_connected", pvs[key])
-
-                pvac_key = f"PVAC--{din}"
-                if pvac_key in vitals:
-                    pvac = vitals[pvac_key]
-                    for string_letter in ["A", "B", "C", "D", "E", "F"]:
-                        state_key = f"PVAC_PvState_{string_letter}"
-                        voltage_key = f"PVAC_PVMeasuredVoltage_{string_letter}"
-                        current_key = f"PVAC_PVCurrent_{string_letter}"
-                        power_key = f"PVAC_PVMeasuredPower_{string_letter}"
-
-                        if state_key in pvac:
-                            add_field(f"string_{string_letter.lower()}_state", pvac[state_key])
-                        if voltage_key in pvac:
-                            add_field(
-                                f"string_{string_letter.lower()}_voltage_v",
-                                _as_float(pvac[voltage_key]),
-                            )
-                        if current_key in pvac:
-                            add_field(
-                                f"string_{string_letter.lower()}_current_a",
-                                _as_float(pvac[current_key]),
-                            )
-                        if power_key in pvac:
-                            add_field(
-                                f"string_{string_letter.lower()}_power_w",
-                                _as_float(pvac[power_key]),
-                            )
+        # Use shared metric extraction logic
+        metrics = extract_snapshot_metrics(snapshot)
+        for metric_name, value in metrics.items():
+            add_field(metric_name, value)
 
         if not fields_parts:
             return None
@@ -635,10 +610,18 @@ class MQTTPublisher:
                 LOGGER.debug("Failed to publish MQTT status message: %s", exc)
 
     def publish(self, snapshot: Dict[str, object]) -> None:
+        """Publish metrics from snapshot to MQTT.
+        
+        Uses the shared extract_snapshot_metrics() function and filters
+        based on configuration.
+        """
         if not self.enabled or not self._connected:
             return
 
-        metrics = self._extract_metrics(snapshot)
+        # Use shared metric extraction logic
+        metrics = extract_snapshot_metrics(snapshot)
+        
+        # Filter to configured metrics if specified
         if self._config.mqtt_metrics:
             metrics = {k: v for k, v in metrics.items() if k in self._config.mqtt_metrics}
 
@@ -665,60 +648,11 @@ class MQTTPublisher:
                 LOGGER.warning("Failed to publish %s to MQTT: %s", metric_name, exc)
 
     def _extract_metrics(self, snapshot: Dict[str, object]) -> Dict[str, object]:
-        metrics: Dict[str, object] = {}
-        metrics["battery_percentage"] = _as_float(snapshot.get("battery_percentage"))
-        power = snapshot.get("power")
-        if isinstance(power, dict):
-            metrics["site_power_w"] = _as_float(power.get("site"))
-            metrics["solar_power_w"] = _as_float(power.get("solar"))
-            metrics["battery_power_w"] = _as_float(power.get("battery"))
-            metrics["load_power_w"] = _as_float(power.get("load"))
-        metrics["battery_nominal_energy_remaining_wh"] = _as_float(
-            snapshot.get("battery_nominal_energy_remaining")
-        )
-        metrics["battery_nominal_full_energy_wh"] = _as_float(
-            snapshot.get("battery_nominal_full_energy")
-        )
-        alerts = snapshot.get("alerts")
-        if isinstance(alerts, list):
-            metrics["alerts_count"] = len(alerts)
-        metrics["grid_status"] = snapshot.get("grid_status")
-        vitals = snapshot.get("vitals")
-        if isinstance(vitals, dict):
-            din = snapshot.get("din")
-            if din:
-                pvs_key = f"PVS--{din}"
-                if pvs_key in vitals:
-                    pvs = vitals[pvs_key]
-                    for string_name in [
-                        "StringA",
-                        "StringB",
-                        "StringC",
-                        "StringD",
-                        "StringE",
-                        "StringF",
-                    ]:
-                        key = f"PVS_{string_name}_Connected"
-                        if key in pvs:
-                            metrics[f"string_{string_name.lower()}_connected"] = pvs[key]
-                pvac_key = f"PVAC--{din}"
-                if pvac_key in vitals:
-                    pvac = vitals[pvac_key]
-                    for string_letter in ["A", "B", "C", "D", "E", "F"]:
-                        state_key = f"PVAC_PvState_{string_letter}"
-                        voltage_key = f"PVAC_PVMeasuredVoltage_{string_letter}"
-                        current_key = f"PVAC_PVCurrent_{string_letter}"
-                        power_key = f"PVAC_PVMeasuredPower_{string_letter}"
-                        prefix = f"string_{string_letter.lower()}"
-                        if state_key in pvac:
-                            metrics[f"{prefix}_state"] = pvac[state_key]
-                        if voltage_key in pvac:
-                            metrics[f"{prefix}_voltage_v"] = _as_float(pvac[voltage_key])
-                        if current_key in pvac:
-                            metrics[f"{prefix}_current_a"] = _as_float(pvac[current_key])
-                        if power_key in pvac:
-                            metrics[f"{prefix}_power_w"] = _as_float(pvac[power_key])
-        return metrics
+        """DEPRECATED: Use extract_snapshot_metrics() instead.
+        
+        Kept for backward compatibility but delegates to shared function.
+        """
+        return extract_snapshot_metrics(snapshot)
 
     def close(self) -> None:
         if self._client:
@@ -752,7 +686,39 @@ def maybe_connect_wifi(config: ServiceConfig) -> None:
         raise
 
 
+def to_float(value: object, default: Optional[float] = None) -> Optional[float]:
+    """Convert a value to float with robust error handling.
+    
+    This consolidated helper replaces _as_float() and provides a simpler interface.
+    Handles None, numeric types, and string conversions gracefully.
+    
+    Args:
+        value: The value to convert to float
+        default: Value to return if conversion fails (defaults to None)
+        
+    Returns:
+        Float value, or default if conversion fails or value is None
+    """
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _extract_float(payload: Dict[str, object], path: Iterable[str]) -> Optional[float]:
+    """Extract a float value from a nested dictionary path.
+    
+    Args:
+        payload: Dictionary to extract from
+        path: Sequence of keys to traverse
+        
+    Returns:
+        Float value if found and convertible, None otherwise
+    """
     current: object = payload
     for key in path:
         if not isinstance(current, dict):
@@ -760,18 +726,94 @@ def _extract_float(payload: Dict[str, object], path: Iterable[str]) -> Optional[
         current = current.get(key)
         if current is None:
             return None
-    try:
-        return float(current)
-    except (TypeError, ValueError):
-        return None
+    return to_float(current)
 
 
+# Keep _as_float for backward compatibility (deprecated)
 def _as_float(value: object) -> Optional[float]:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+    """DEPRECATED: Use to_float() instead.
+    
+    Kept for backward compatibility.
+    """
+    return to_float(value)
+
+
+def extract_snapshot_metrics(snapshot: Dict[str, object]) -> Dict[str, object]:
+    """Extract all metrics from a Powerwall snapshot.
+    
+    This shared function is used by both InfluxWriter and MQTTPublisher
+    to ensure consistency in metric extraction and reduce code duplication.
+    
+    Args:
+        snapshot: Raw snapshot dictionary from PowerwallPoller
+        
+    Returns:
+        Dictionary of metric names to values (float, int, str, or bool)
+    """
+    metrics: Dict[str, object] = {}
+    
+    # Basic metrics
+    metrics["battery_percentage"] = to_float(snapshot.get("battery_percentage"))
+    
+    # Power metrics
+    power = snapshot.get("power")
+    if isinstance(power, dict):
+        metrics["site_power_w"] = to_float(power.get("site"))
+        metrics["solar_power_w"] = to_float(power.get("solar"))
+        metrics["battery_power_w"] = to_float(power.get("battery"))
+        metrics["load_power_w"] = to_float(power.get("load"))
+    
+    # Battery energy metrics
+    metrics["battery_nominal_energy_remaining_wh"] = to_float(
+        snapshot.get("battery_nominal_energy_remaining")
+    )
+    metrics["battery_nominal_full_energy_wh"] = to_float(
+        snapshot.get("battery_nominal_full_energy")
+    )
+    
+    # Alerts
+    alerts = snapshot.get("alerts")
+    if isinstance(alerts, list):
+        metrics["alerts_count"] = len(alerts)
+        if alerts:
+            metrics["alerts"] = ";".join(sorted(str(a) for a in alerts))
+    
+    # Grid status and device ID
+    metrics["grid_status"] = snapshot.get("grid_status")
+    metrics["din"] = snapshot.get("din")
+    
+    # Vitals - String metrics
+    vitals = snapshot.get("vitals")
+    if isinstance(vitals, dict):
+        din = snapshot.get("din")
+        if din:
+            # PVS (PhotoVoltaic System) string connection status
+            pvs_key = f"PVS--{din}"
+            if pvs_key in vitals:
+                pvs = vitals[pvs_key]
+                for string_name in ["StringA", "StringB", "StringC", "StringD", "StringE", "StringF"]:
+                    key = f"PVS_{string_name}_Connected"
+                    if key in pvs:
+                        metrics[f"string_{string_name.lower()}_connected"] = pvs[key]
+            
+            # PVAC (PhotoVoltaic AC) string detailed metrics
+            pvac_key = f"PVAC--{din}"
+            if pvac_key in vitals:
+                pvac = vitals[pvac_key]
+                for string_letter in ["A", "B", "C", "D", "E", "F"]:
+                    state_key = f"PVAC_PvState_{string_letter}"
+                    voltage_key = f"PVAC_PVMeasuredVoltage_{string_letter}"
+                    current_key = f"PVAC_PVCurrent_{string_letter}"
+                    power_key = f"PVAC_PVMeasuredPower_{string_letter}"
+                    prefix = f"string_{string_letter.lower()}"
+                    
+                    if state_key in pvac:
+                        metrics[f"{prefix}_state"] = pvac[state_key]
+                    if voltage_key in pvac:
+                        metrics[f"{prefix}_voltage_v"] = to_float(pvac[voltage_key])
+                    if current_key in pvac:
+                        metrics[f"{prefix}_current_a"] = to_float(pvac[current_key])
+                    if power_key in pvac:
+                        metrics[f"{prefix}_power_w"] = to_float(pvac[power_key])
+    
+    return metrics

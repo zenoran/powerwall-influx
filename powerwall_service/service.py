@@ -70,16 +70,16 @@ class PowerwallService:
         self._background_task: Optional[asyncio.Task[None]] = None
         self._stop_event = asyncio.Event()
 
+        # Primary state - reduced redundancy by deriving most values from _last_result
         self._last_result: Optional[PollingResult] = None
-        self._last_success_at: Optional[datetime] = None
         self._consecutive_failures = 0
-        self._last_powerwall_error: Optional[str] = None
-        self._last_influx_error: Optional[str] = None
-        self._last_mqtt_error: Optional[str] = None
+        
+        # Success timestamps (not stored in PollingResult for backward compat)
+        self._last_success_at: Optional[datetime] = None
         self._last_influx_success: Optional[datetime] = None
         self._last_mqtt_success: Optional[datetime] = None
-        self._last_wifi_error: Optional[str] = None
 
+        self._last_wifi_error: Optional[str] = None
         self._wifi_retry_seconds = 300
         self._last_wifi_attempt = 0.0
         
@@ -102,6 +102,25 @@ class PowerwallService:
                 LOGGER.error("Failed to initialize health monitor: %s", exc)
                 self._health_monitor = None
 
+    # ------------------------------------------------------------------
+    # Properties that derive error state from _last_result (read-only)
+    # This eliminates redundant state variables
+    
+    @property
+    def _last_powerwall_error(self) -> Optional[str]:
+        """Most recent Powerwall error from last polling result."""
+        return self._last_result.powerwall_error if self._last_result else None
+    
+    @property
+    def _last_influx_error(self) -> Optional[str]:
+        """Most recent InfluxDB error from last polling result."""
+        return self._last_result.influx_error if self._last_result else None
+    
+    @property
+    def _last_mqtt_error(self) -> Optional[str]:
+        """Most recent MQTT error from last polling result."""
+        return self._last_result.mqtt_error if self._last_result else None
+    
     # ------------------------------------------------------------------
     async def start(self) -> None:
         if self._background_task and not self._background_task.done():
@@ -170,63 +189,65 @@ class PowerwallService:
         return self._background_task is not None and not self._background_task.done()
 
     def get_health_report(self) -> HealthReport:
+        """Get comprehensive health report for all service components.
+        
+        Uses a factory method to reduce repetition in component creation.
+        """
         components: Dict[str, ComponentHealth] = {}
 
+        # Powerwall component
         components["powerwall"] = ComponentHealth(
             name="powerwall",
             healthy=self._last_powerwall_error is None,
-            detail=None if self._last_powerwall_error is None else self._last_powerwall_error,
+            detail=self._last_powerwall_error,
             last_success=self._last_success_at,
             last_error=self._last_powerwall_error,
         )
 
+        # InfluxDB component
         components["influxdb"] = ComponentHealth(
             name="influxdb",
             healthy=self._last_influx_error is None,
-            detail=None if self._last_influx_error is None else self._last_influx_error,
+            detail=self._last_influx_error,
             last_success=self._last_influx_success,
             last_error=self._last_influx_error,
         )
 
+        # MQTT component (varies based on whether MQTT is enabled)
         if self._mqtt:
-            healthy = self._last_mqtt_error is None and self._mqtt.connected
-            detail = None
-            if not healthy:
-                detail = self._last_mqtt_error or "MQTT not connected"
-            components["mqtt"] = ComponentHealth(
-                name="mqtt",
-                healthy=healthy,
-                detail=detail,
-                last_success=self._last_mqtt_success,
-                last_error=self._last_mqtt_error,
-            )
+            mqtt_healthy = self._last_mqtt_error is None and self._mqtt.connected
+            mqtt_detail = self._last_mqtt_error or ("MQTT not connected" if not mqtt_healthy else None)
         else:
-            components["mqtt"] = ComponentHealth(
-                name="mqtt",
-                healthy=not self._config.mqtt_enabled,
-                detail=None if not self._config.mqtt_enabled else "MQTT disabled",
-                last_success=self._last_mqtt_success,
-                last_error=self._last_mqtt_error,
-            )
+            mqtt_healthy = not self._config.mqtt_enabled
+            mqtt_detail = None if not self._config.mqtt_enabled else "MQTT disabled"
+        
+        components["mqtt"] = ComponentHealth(
+            name="mqtt",
+            healthy=mqtt_healthy,
+            detail=mqtt_detail,
+            last_success=self._last_mqtt_success,
+            last_error=self._last_mqtt_error,
+        )
 
+        # WiFi component (varies based on whether WiFi auto-connect is enabled)
         if self._config.connect_wifi:
-            components["wifi"] = ComponentHealth(
-                name="wifi",
-                healthy=self._last_wifi_error is None,
-                detail=None if self._last_wifi_error is None else self._last_wifi_error,
-                last_success=None,  # Not tracking success time
-                last_error=self._last_wifi_error,
-            )
+            wifi_healthy = self._last_wifi_error is None
+            wifi_detail = self._last_wifi_error
         else:
-            components["wifi"] = ComponentHealth(
-                name="wifi",
-                healthy=True,
-                detail="Wi-Fi auto-connect disabled",
-                last_success=None,
-                last_error=None,
-            )
+            wifi_healthy = True
+            wifi_detail = "Wi-Fi auto-connect disabled"
+        
+        components["wifi"] = ComponentHealth(
+            name="wifi",
+            healthy=wifi_healthy,
+            detail=wifi_detail,
+            last_success=None,  # Not tracking WiFi success time
+            last_error=self._last_wifi_error,
+        )
 
+        # Overall health is true only if all components are healthy
         overall = all(component.healthy for component in components.values())
+        
         return HealthReport(
             overall=overall,
             components=components,
@@ -284,21 +305,17 @@ class PowerwallService:
                     try:
                         self._writer.write(line)
                         pushed_influx = True
-                        self._last_influx_error = None
                     except Exception as exc:
                         influx_error = str(exc)
                         LOGGER.warning("InfluxDB write failed: %s", exc)
-                        self._last_influx_error = influx_error
             if publish_mqtt and self._mqtt:
                 try:
                     self._mqtt.publish(snapshot)
                     self._mqtt.publish_availability(True)
                     published = True
-                    self._last_mqtt_error = None
                 except Exception as exc:
                     mqtt_error = str(exc)
                     LOGGER.warning("Failed to publish metrics to MQTT: %s", exc)
-                    self._last_mqtt_error = mqtt_error
 
         if snapshot is None and powerwall_error is None:
             powerwall_error = "snapshot unavailable"
@@ -316,29 +333,32 @@ class PowerwallService:
         )
 
     def _update_state(self, result: PollingResult) -> None:
+        """Update service state from a polling result.
+        
+        Note: Error states are now derived from _last_result properties,
+        so we don't need separate error variable assignments.
+        """
         self._last_result = result
         if result.success:
             self._last_success_at = result.timestamp
             self._consecutive_failures = 0
-            self._last_powerwall_error = None
         else:
             self._consecutive_failures += 1
-            self._last_powerwall_error = result.powerwall_error
 
         if result.pushed_influx:
             self._last_influx_success = result.timestamp
         if result.published_mqtt:
             self._last_mqtt_success = result.timestamp
-        if result.influx_error:
-            self._last_influx_error = result.influx_error
-        if result.mqtt_error:
-            self._last_mqtt_error = result.mqtt_error
 
         if not result.success and self._mqtt:
             self._mqtt.publish_availability(False, status_message=result.powerwall_error)
 
     def _handle_powerwall_failure(self, message: str) -> None:
-        self._last_powerwall_error = message
+        """Handle Powerwall connection/polling failures.
+        
+        Note: Error state is stored in _last_result, not in a separate variable.
+        This method handles WiFi reconnection logic when failures occur.
+        """
         if self._mqtt:
             self._mqtt.publish_availability(False, status_message=message[:512])
         if self._config.connect_wifi:

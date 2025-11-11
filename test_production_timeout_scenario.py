@@ -5,6 +5,7 @@ This test simulates the production behavior to understand why the service
 didn't recover during the 12+ hour outage.
 """
 
+import asyncio
 import unittest
 from unittest.mock import Mock, MagicMock, patch
 import time
@@ -79,64 +80,68 @@ class TestProductionTimeoutScenario(unittest.TestCase):
         - NO WiFi reconnection attempts (THIS IS THE BUG!)
         - Service never recovered
         """
-        from powerwall_service.service import PowerwallService
-        import socket
-        
-        # Simulate:
-        # - First connection succeeds
-        # - Subsequent calls timeout (simulating network drop)
-        mock_pw = MagicMock()
-        mock_pw.is_connected.return_value = True
-        
-        # First fetch_snapshot works
-        call_count = [0]
-        def power_side_effect():
-            call_count[0] += 1
-            if call_count[0] == 1:
-                # First call succeeds
-                return {'battery': 100, 'load': 50, 'solar': 75, 'grid': -25}
-            else:
-                # All subsequent calls timeout
-                raise socket.timeout("Timed out")
-        
-        mock_pw.power.side_effect = power_side_effect
-        mock_pw.site_name.return_value = "Test Site"
-        mock_pw.version.return_value = "1.0"
-        mock_pw.din.return_value = "123"
-        mock_pw.level.return_value = 100
-        mock_pw.status.return_value = {}
-        mock_pw.strings.return_value = []
-        mock_pw.vitals.return_value = {}
-        mock_pw.temps.return_value = {}
-        mock_pw.alerts.return_value = []
-        
-        mock_powerwall_class.return_value = mock_pw
-        
-        service = PowerwallService(self.config)
-        
-        try:
-            # First poll should succeed
-            service.poll_once()
-            self.assertEqual(call_count[0], 1, "First poll should succeed")
+        async def run_test():
+            from powerwall_service.service import PowerwallService
+            import socket
             
-            # Now simulate multiple failed polls like in production
-            for i in range(5):  # Simulate 5 failures
-                try:
-                    service.poll_once()
-                except PowerwallUnavailableError:
-                    pass  # Expected
+            # Simulate:
+            # - First connection succeeds
+            # - Subsequent calls timeout (simulating network drop)
+            mock_pw = MagicMock()
+            mock_pw.is_connected.return_value = True
             
-            # CRITICAL CHECK: Did WiFi reconnection run?
-            # Production logs showed ZERO WiFi attempts!
-            print(f"\nWiFi reconnection called {mock_wifi.call_count} times")
-            print(f"WiFi calls: {mock_wifi.call_args_list}")
+            # First fetch_snapshot works
+            call_count = [0]
+            def power_side_effect():
+                call_count[0] += 1
+                if call_count[0] == 1:
+                    # First call succeeds
+                    return {'battery': 100, 'load': 50, 'solar': 75, 'grid': -25}
+                else:
+                    # All subsequent calls timeout
+                    raise socket.timeout("Timed out")
             
-            # This is the key assertion - WiFi SHOULD have been called
-            self.assertGreater(mock_wifi.call_count, 0,
-                             "WiFi reconnection should have been attempted after failures!")
+            mock_pw.power.side_effect = power_side_effect
+            mock_pw.site_name.return_value = "Test Site"
+            mock_pw.version.return_value = "1.0"
+            mock_pw.din.return_value = "123"
+            mock_pw.level.return_value = 100
+            mock_pw.status.return_value = {}
+            mock_pw.strings.return_value = []
+            mock_pw.vitals.return_value = {}
+            mock_pw.temps.return_value = {}
+            mock_pw.alerts.return_value = []
             
-        finally:
-            service.close()
+            mock_powerwall_class.return_value = mock_pw
+            
+            service = PowerwallService(self.config)
+            
+            try:
+                # First poll should succeed
+                await service.poll_once()
+                self.assertEqual(call_count[0], 1, "First poll should succeed")
+                
+                # Now simulate multiple failed polls like in production
+                for i in range(5):  # Simulate 5 failures
+                    try:
+                        await service.poll_once()
+                    except PowerwallUnavailableError:
+                        pass  # Expected
+                
+                # CRITICAL CHECK: Did WiFi reconnection run?
+                # Production logs showed ZERO WiFi attempts!
+                print(f"\nWiFi reconnection called {mock_wifi.call_count} times")
+                print(f"WiFi calls: {mock_wifi.call_args_list}")
+                
+                # This is the key assertion - WiFi SHOULD have been called
+                self.assertGreater(mock_wifi.call_count, 0,
+                                 "WiFi reconnection should have been attempted after failures!")
+                
+            finally:
+                await service.stop()
+        
+        # Run the async test
+        asyncio.run(run_test())
 
 
 if __name__ == '__main__':

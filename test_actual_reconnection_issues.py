@@ -66,7 +66,7 @@ class TestStaleConnectionRecreation(unittest.TestCase):
     def setUp(self):
         self.config = create_test_config()
 
-    @patch('powerwall_service.clients.pypowerwall.Powerwall')
+    @patch('powerwall_service.powerwall_client.pypowerwall.Powerwall')
     def test_connection_object_recreated_after_failure(self, mock_powerwall_class):
         """CRITICAL: Verify we create a NEW Powerwall object after connection dies.
         
@@ -115,7 +115,7 @@ class TestStaleConnectionRecreation(unittest.TestCase):
         finally:
             poller.close()
 
-    @patch('powerwall_service.clients.pypowerwall.Powerwall')
+    @patch('powerwall_service.powerwall_client.pypowerwall.Powerwall')
     def test_is_connected_stale_status_detected(self, mock_powerwall_class):
         """Verify we handle cases where is_connected() reports stale True status.
         
@@ -146,7 +146,7 @@ class TestStaleConnectionRecreation(unittest.TestCase):
         finally:
             poller.close()
 
-    @patch('powerwall_service.clients.pypowerwall.Powerwall')
+    @patch('powerwall_service.powerwall_client.pypowerwall.Powerwall')
     def test_force_reconnect_destroys_old_object(self, mock_powerwall_class):
         """Verify force_reconnect actually creates a fresh Powerwall object."""
         from powerwall_service.clients import PowerwallPoller
@@ -192,7 +192,7 @@ class TestWiFiReconnectionTriggers(unittest.TestCase):
         self.config = create_test_config()
 
     @patch('powerwall_service.service.maybe_connect_wifi')
-    @patch('powerwall_service.clients.pypowerwall.Powerwall')
+    @patch('powerwall_service.powerwall_client.pypowerwall.Powerwall')
     def test_wifi_runs_on_first_failure(self, mock_powerwall_class, mock_wifi):
         """CRITICAL: WiFi reconnection MUST run on first failure.
         
@@ -216,7 +216,7 @@ class TestWiFiReconnectionTriggers(unittest.TestCase):
             service._poller.close()
 
     @patch('powerwall_service.service.maybe_connect_wifi')
-    @patch('powerwall_service.clients.pypowerwall.Powerwall')
+    @patch('powerwall_service.powerwall_client.pypowerwall.Powerwall')
     def test_wifi_success_allows_immediate_retry(self, mock_powerwall_class, mock_wifi):
         """After WiFi reconnects, service should immediately retry Powerwall connection."""
         from powerwall_service.service import PowerwallService
@@ -261,7 +261,7 @@ class TestWiFiReconnectionTriggers(unittest.TestCase):
 class TestSessionStateReset(unittest.TestCase):
     """Test that connection session state is properly reset on reconnection."""
 
-    @patch('powerwall_service.clients.pypowerwall.Powerwall')
+    @patch('powerwall_service.powerwall_client.pypowerwall.Powerwall')
     def test_close_cleans_up_powerwall_object(self, mock_powerwall_class):
         """Verify close() actually destroys the Powerwall object."""
         from powerwall_service.clients import PowerwallPoller
@@ -285,7 +285,7 @@ class TestSessionStateReset(unittest.TestCase):
                          "close() should set _powerwall to None")
         mock_pw.client.close_session.assert_called_once()
 
-    @patch('powerwall_service.clients.pypowerwall.Powerwall')
+    @patch('powerwall_service.powerwall_client.pypowerwall.Powerwall')
     def test_reconnection_after_close_creates_fresh_object(self, mock_powerwall_class):
         """After close(), next connection should create completely fresh object."""
         from powerwall_service.clients import PowerwallPoller

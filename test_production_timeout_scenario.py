@@ -65,7 +65,7 @@ class TestProductionTimeoutScenario(unittest.TestCase):
         self.config = create_test_config()
 
     @patch('powerwall_service.service.maybe_connect_wifi')
-    @patch('powerwall_service.clients.pypowerwall.Powerwall')
+    @patch('powerwall_service.powerwall_client.pypowerwall.Powerwall')
     def test_continuous_timeout_errors_like_production(self, mock_powerwall_class, mock_wifi):
         """
         Simulate production scenario:

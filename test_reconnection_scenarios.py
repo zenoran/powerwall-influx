@@ -81,7 +81,7 @@ class TestConnectionBackoffScenarios(unittest.TestCase):
         if hasattr(self, 'poller'):
             self.poller.close()
 
-    @patch('powerwall_service.clients.pypowerwall.Powerwall')
+    @patch('powerwall_service.powerwall_client.pypowerwall.Powerwall')
     def test_timestamp_set_on_connection_failure(self, mock_powerwall_class):
         """Verify _last_connection_attempt is set when connection fails.
         
@@ -126,7 +126,7 @@ class TestConnectionBackoffScenarios(unittest.TestCase):
         self.assertGreater(self.poller._last_connection_attempt, first_attempt_time,
                           "Timestamp should be updated on each actual connection attempt")
 
-    @patch('powerwall_service.clients.pypowerwall.Powerwall')
+    @patch('powerwall_service.powerwall_client.pypowerwall.Powerwall')
     def test_exponential_backoff_prevents_rapid_retries(self, mock_powerwall_class):
         """Verify exponential backoff prevents connection attempts during backoff period.
         
@@ -153,8 +153,8 @@ class TestConnectionBackoffScenarios(unittest.TestCase):
         self.assertIn("Backoff active", str(ctx.exception))
         self.assertIn("Will retry in", str(ctx.exception))
 
-    @patch('powerwall_service.clients.pypowerwall.Powerwall')
-    @patch('powerwall_service.clients.time.monotonic')
+    @patch('powerwall_service.powerwall_client.pypowerwall.Powerwall')
+    @patch('powerwall_service.powerwall_client.time.monotonic')
     def test_backoff_times_match_expected_values(self, mock_monotonic, mock_powerwall_class):
         """Verify backoff times follow exponential pattern: 30s, 60s, 120s, 240s, 300s (max)."""
         from powerwall_service.clients import PowerwallUnavailableError
@@ -192,7 +192,7 @@ class TestConnectionBackoffScenarios(unittest.TestCase):
             # Advance time past backoff period
             mock_monotonic.return_value = self.poller._last_connection_attempt + expected_backoff + 1.0
 
-    @patch('powerwall_service.clients.pypowerwall.Powerwall')
+    @patch('powerwall_service.powerwall_client.pypowerwall.Powerwall')
     def test_backoff_resets_on_successful_connection(self, mock_powerwall_class):
         """Verify backoff is reset when connection succeeds."""
         from powerwall_service.clients import PowerwallUnavailableError
@@ -242,7 +242,7 @@ class TestWiFiReconnectionScenarios(unittest.TestCase):
         )
 
     @patch('powerwall_service.service.maybe_connect_wifi')
-    @patch('powerwall_service.clients.pypowerwall.Powerwall')
+    @patch('powerwall_service.powerwall_client.pypowerwall.Powerwall')
     def test_wifi_reconnection_triggered_on_failure(self, mock_powerwall_class, mock_connect_wifi):
         """Verify WiFi reconnection is attempted when Powerwall connection fails.
         
@@ -272,7 +272,7 @@ class TestWiFiReconnectionScenarios(unittest.TestCase):
             service._poller.close()
 
     @patch('powerwall_service.service.maybe_connect_wifi')
-    @patch('powerwall_service.clients.pypowerwall.Powerwall')
+    @patch('powerwall_service.powerwall_client.pypowerwall.Powerwall')
     def test_wifi_reconnection_respects_60_second_interval(self, mock_powerwall_class, mock_connect_wifi):
         """Verify WiFi reconnection attempts are throttled to prevent rapid retries.
         
@@ -311,7 +311,7 @@ class TestWiFiReconnectionScenarios(unittest.TestCase):
             service._poller.close()
 
     @patch('powerwall_service.service.maybe_connect_wifi')
-    @patch('powerwall_service.clients.pypowerwall.Powerwall')
+    @patch('powerwall_service.powerwall_client.pypowerwall.Powerwall')
     def test_wifi_success_resets_connection_failures(self, mock_powerwall_class, mock_connect_wifi):
         """Verify successful WiFi reconnection resets Powerwall connection failure counter."""
         from powerwall_service.service import PowerwallService
@@ -359,13 +359,13 @@ class TestLoggingScenarios(unittest.TestCase):
             wifi_password="test123",
         )
 
-    @patch('powerwall_service.clients.pypowerwall.Powerwall')
+    @patch('powerwall_service.powerwall_client.pypowerwall.Powerwall')
     def test_connection_failure_logging(self, mock_powerwall_class):
         """Verify connection failures are logged at appropriate levels."""
         from powerwall_service.clients import PowerwallPoller, PowerwallUnavailableError
         
         # Capture log output
-        with self.assertLogs('powerwall_service.clients', level='INFO') as log_context:
+        with self.assertLogs('powerwall_service.powerwall_client', level='INFO') as log_context:
             mock_powerwall_class.side_effect = ConnectionError("Connection timed out")
             
             poller = PowerwallPoller(self.config)
@@ -393,7 +393,7 @@ class TestLoggingScenarios(unittest.TestCase):
                 poller.close()
 
     @patch('powerwall_service.service.maybe_connect_wifi')
-    @patch('powerwall_service.clients.pypowerwall.Powerwall')
+    @patch('powerwall_service.powerwall_client.pypowerwall.Powerwall')
     def test_service_level_failure_logging(self, mock_powerwall_class, mock_connect_wifi):
         """Verify service logs Powerwall gateway unreachable messages."""
         from powerwall_service.service import PowerwallService
@@ -418,7 +418,7 @@ class TestLoggingScenarios(unittest.TestCase):
                 service._poller.close()
 
     @patch('powerwall_service.service.maybe_connect_wifi')
-    @patch('powerwall_service.clients.pypowerwall.Powerwall')
+    @patch('powerwall_service.powerwall_client.pypowerwall.Powerwall')
     def test_wifi_reconnection_logging(self, mock_powerwall_class, mock_connect_wifi):
         """Verify WiFi reconnection attempts are logged."""
         from powerwall_service.service import PowerwallService
@@ -464,8 +464,8 @@ class TestProductionScenarioSimulation(unittest.TestCase):
         )
 
     @patch('powerwall_service.service.maybe_connect_wifi')
-    @patch('powerwall_service.clients.pypowerwall.Powerwall')
-    @patch('powerwall_service.clients.time.monotonic')
+    @patch('powerwall_service.powerwall_client.pypowerwall.Powerwall')
+    @patch('powerwall_service.powerwall_client.time.monotonic')
     def test_12_hour_outage_scenario(self, mock_monotonic, mock_powerwall_class, mock_connect_wifi):
         """Simulate 12+ hour connection failure scenario from production.
         

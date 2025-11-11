@@ -6,7 +6,6 @@ from typing import Dict, Iterable, Optional
 def to_float(value: object, default: Optional[float] = None) -> Optional[float]:
     """Convert a value to float with robust error handling.
     
-    This consolidated helper replaces _as_float() and provides a simpler interface.
     Handles None, numeric types, and string conversions gracefully.
     
     Args:
@@ -44,15 +43,6 @@ def _extract_float(payload: Dict[str, object], path: Iterable[str]) -> Optional[
         if current is None:
             return None
     return to_float(current)
-
-
-# Keep _as_float for backward compatibility (deprecated)
-def _as_float(value: object) -> Optional[float]:
-    """DEPRECATED: Use to_float() instead.
-    
-    Kept for backward compatibility.
-    """
-    return to_float(value)
 
 
 def extract_snapshot_metrics(snapshot: Dict[str, object]) -> Dict[str, object]:

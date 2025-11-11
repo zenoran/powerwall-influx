@@ -160,13 +160,6 @@ class MQTTPublisher:
                 self._last_error = str(exc)
                 LOGGER.warning("Failed to publish %s to MQTT: %s", metric_name, exc)
 
-    def _extract_metrics(self, snapshot: Dict[str, object]) -> Dict[str, object]:
-        """DEPRECATED: Use extract_snapshot_metrics() instead.
-        
-        Kept for backward compatibility but delegates to shared function.
-        """
-        return extract_snapshot_metrics(snapshot)
-
     def close(self) -> None:
         """Close the MQTT connection."""
         if self._client:

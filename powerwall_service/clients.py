@@ -15,7 +15,7 @@ For new code, consider importing directly from:
 from .powerwall_client import PowerwallPoller, PowerwallUnavailableError
 from .influx_writer import InfluxWriter
 from .mqtt_publisher import MQTTPublisher
-from .metrics import extract_snapshot_metrics, to_float, _as_float, _extract_float
+from .metrics import extract_snapshot_metrics, to_float, _extract_float
 from .helpers import maybe_connect_wifi
 
 __all__ = [
@@ -25,7 +25,6 @@ __all__ = [
     "MQTTPublisher",
     "extract_snapshot_metrics",
     "to_float",
-    "_as_float",
     "_extract_float",
     "maybe_connect_wifi",
 ]

@@ -268,7 +268,8 @@ class PowerwallService:
             snapshot = self._poller.fetch_snapshot()
         except PowerwallUnavailableError as exc:
             powerwall_error = str(exc)
-            LOGGER.warning("Powerwall gateway unreachable: %s", exc)
+            LOGGER.warning("Powerwall gateway unreachable (failure %d): %s", 
+                          self._consecutive_failures + 1, exc)
             self._handle_powerwall_failure(powerwall_error)
         except Exception as exc:  # pragma: no cover - unexpected
             powerwall_error = f"unexpected error: {exc}"
@@ -320,24 +321,9 @@ class PowerwallService:
             self._last_success_at = result.timestamp
             self._consecutive_failures = 0
             self._last_powerwall_error = None
-            # Reset connection failure counter on successful poll
-            if hasattr(self._poller, '_consecutive_connection_failures'):
-                if self._poller._consecutive_connection_failures > 0:
-                    LOGGER.debug("Resetting connection failure counter after successful poll")
-                self._poller._consecutive_connection_failures = 0
         else:
             self._consecutive_failures += 1
             self._last_powerwall_error = result.powerwall_error
-            
-            # After several consecutive failures, give the connection a chance to retry
-            # by resetting the connection failure counter
-            if self._consecutive_failures >= 5 and hasattr(self._poller, '_consecutive_connection_failures'):
-                if self._poller._consecutive_connection_failures > 0:
-                    LOGGER.info(
-                        "Resetting connection failure counter after %d poll failures to allow retry",
-                        self._consecutive_failures
-                    )
-                    self._poller._consecutive_connection_failures = 0
 
         if result.pushed_influx:
             self._last_influx_success = result.timestamp
@@ -357,15 +343,38 @@ class PowerwallService:
             self._mqtt.publish_availability(False, status_message=message[:512])
         if self._config.connect_wifi:
             now = time.monotonic()
-            if now - self._last_wifi_attempt >= self._wifi_retry_seconds:
+            time_since_last_wifi_attempt = now - self._last_wifi_attempt
+            if time_since_last_wifi_attempt >= self._wifi_retry_seconds:
+                LOGGER.info(
+                    "Attempting WiFi reconnection to '%s' (%ds since last attempt)",
+                    self._config.wifi_ssid,
+                    int(time_since_last_wifi_attempt)
+                )
                 try:
                     maybe_connect_wifi(self._config)
                     self._last_wifi_error = None  # Success
+                    # WiFi reconnection succeeded - reset connection failure counter
+                    # to allow immediate reconnection attempt on next poll
+                    if hasattr(self._poller, '_consecutive_connection_failures'):
+                        if self._poller._consecutive_connection_failures > 0:
+                            LOGGER.info(
+                                "WiFi reconnected successfully, resetting connection failure counter "
+                                "(%d failures) to allow reconnection",
+                                self._poller._consecutive_connection_failures
+                            )
+                            self._poller._consecutive_connection_failures = 0
+                            self._poller._last_connection_attempt = 0.0  # Reset backoff timer
                 except Exception as exc:  # pragma: no cover - environment dependent
                     self._last_wifi_error = str(exc)
                     LOGGER.warning("Wi-Fi reconnection attempt failed: %s", exc)
                 finally:
                     self._last_wifi_attempt = time.monotonic()
+            else:
+                waiting_time = self._wifi_retry_seconds - time_since_last_wifi_attempt
+                LOGGER.debug(
+                    "Skipping WiFi reconnection (%.0fs until next attempt)",
+                    waiting_time
+                )
 
     def _maybe_join_wifi(self) -> None:
         try:

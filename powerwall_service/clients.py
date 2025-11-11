@@ -95,7 +95,9 @@ class PowerwallPoller:
         self._consecutive_auth_failures = 0
         self._max_auth_failures = 3  # Force full reconnect after this many 403s
         self._consecutive_connection_failures = 0
-        self._max_connection_failures = 2  # Don't retry connection creation too many times
+        self._last_connection_attempt = 0.0  # Timestamp of last connection attempt
+        self._backoff_base = 30.0  # Base backoff time in seconds (30s)
+        self._backoff_max = 300.0  # Maximum backoff time (5 minutes)
 
     def close(self) -> None:
         if self._powerwall and getattr(self._powerwall, "client", None):
@@ -123,16 +125,36 @@ class PowerwallPoller:
         if not self._powerwall:
             self.close()  # Ensure clean state
         
-        # Don't retry connection creation if we've failed too many times recently
-        if self._consecutive_connection_failures >= self._max_connection_failures:
-            LOGGER.debug(
-                "Skipping connection attempt (%d consecutive failures). Will retry on next poll.",
-                self._consecutive_connection_failures
+        # Implement exponential backoff instead of hard circuit breaker
+        # This allows automatic recovery but with increasing delays
+        if self._consecutive_connection_failures > 0:
+            now = time.monotonic()
+            time_since_last_attempt = now - self._last_connection_attempt
+            
+            # Calculate exponential backoff: base * 2^(failures-1), capped at max
+            backoff_time = min(
+                self._backoff_base * (2 ** (self._consecutive_connection_failures - 1)),
+                self._backoff_max
             )
-            raise PowerwallUnavailableError(
-                f"Too many consecutive connection failures ({self._consecutive_connection_failures}). "
-                f"Powerwall at {self._config.host} may be offline."
-            )
+            
+            if time_since_last_attempt < backoff_time:
+                remaining = backoff_time - time_since_last_attempt
+                LOGGER.info(
+                    "Exponential backoff active after %d failures: waiting %.0fs before retry (%.0fs remaining)",
+                    self._consecutive_connection_failures,
+                    backoff_time,
+                    remaining
+                )
+                raise PowerwallUnavailableError(
+                    f"Backoff active after {self._consecutive_connection_failures} failures. "
+                    f"Will retry in {remaining:.0f}s. Powerwall at {self._config.host} may be offline."
+                )
+            else:
+                LOGGER.info(
+                    "Backoff period expired after %d failures (%.0fs elapsed), attempting reconnection",
+                    self._consecutive_connection_failures,
+                    time_since_last_attempt
+                )
             
         gw_pwd = (
             self._config.gateway_password
@@ -148,10 +170,11 @@ class PowerwallPoller:
         use_local_mode = bool(self._config.host)
         
         LOGGER.debug(
-            "Connecting to Powerwall host=%s email=%s mode=%s (fast-fail)",
+            "Connecting to Powerwall host=%s email=%s mode=%s (attempt after %d failures)",
             self._config.host,
             email,
             "local" if use_local_mode else "cloud",
+            self._consecutive_connection_failures,
         )
         try:
             # Disable auto_select and retry_modes to fail fast and avoid trying unconfigured modes
@@ -178,10 +201,16 @@ class PowerwallPoller:
             self._consecutive_connection_failures = 0
         except Exception as exc:
             self._consecutive_connection_failures += 1
+            self._last_connection_attempt = time.monotonic()  # CRITICAL: Set timestamp when connection fails
+            # Calculate next backoff time for logging
+            next_backoff = min(
+                self._backoff_base * (2 ** (self._consecutive_connection_failures - 1)),
+                self._backoff_max
+            )
             LOGGER.warning(
-                "Connection attempt failed (%d/%d): %s",
+                "Connection attempt failed (failure %d, next retry in %.0fs): %s",
                 self._consecutive_connection_failures,
-                self._max_connection_failures,
+                next_backoff,
                 exc
             )
             if _is_connection_error(exc):

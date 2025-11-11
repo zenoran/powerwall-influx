@@ -1,23 +1,43 @@
-# Grafana Dashboard
+# Grafana Dashboard# Grafana Dashboard
 
-The `powerwall-dashboard.json` file provides an importable Grafana dashboard for visualising the metrics written by this service.
 
-## Import steps
 
-1. Open **Grafana → Dashboards → New → Import**.
-2. Click **Upload JSON file** and select `grafana/powerwall-dashboard.json` from this repository.
-3. When prompted, choose the InfluxDB data source you already configured (Flux query language). This must be an InfluxDB 2.x connection.
-4. Provide defaults for the dashboard variables if Grafana requests them:
+The `powerwall-dashboard.json` file in this directory provides a pre-configured Grafana dashboard for visualizing Powerwall metrics from InfluxDB.The `powerwall-dashboard.json` file provides an importable Grafana dashboard for visualising the metrics written by this service.
+
+
+
+## Quick Import## Import steps
+
+
+
+1. Open **Grafana → Dashboards → New → Import**1. Open **Grafana → Dashboards → New → Import**.
+
+2. Upload `grafana/powerwall-dashboard.json`2. Click **Upload JSON file** and select `grafana/powerwall-dashboard.json` from this repository.
+
+3. Select your InfluxDB 2.x data source (Flux query language)3. When prompted, choose the InfluxDB data source you already configured (Flux query language). This must be an InfluxDB 2.x connection.
+
+4. Configure dashboard variables (bucket, measurement, site)4. Provide defaults for the dashboard variables if Grafana requests them:
+
    - **Bucket** – the Influx bucket where Powerwall metrics are stored (default `powerwall`).
-   - **Measurement** – typically `powerwall` unless you customised it.
+
+## Full Documentation   - **Measurement** – typically `powerwall` unless you customised it.
+
    - **Site** – the site tag value. The export ships with `Bzzzt` pre-selected based on the captured dataset—replace it with your own site tag if Grafana prompts.
 
-## Dashboard contents
+For complete documentation including:
 
-The dashboard is organised into several focus areas:
+- Detailed import steps## Dashboard contents
+
+- Dashboard contents and panels
+
+- Customization optionsThe dashboard is organised into several focus areas:
+
+- Variable configuration
 
 - **Battery State of Charge** – Stat panel summarising the current battery percentage.
-- **Energy Remaining** – Gauge derived from the remaining vs. full pack energy to show available energy (%).
+
+**See the [Grafana Dashboard](../README.md#grafana-dashboard) section in the main README.**- **Energy Remaining** – Gauge derived from the remaining vs. full pack energy to show available energy (%).
+
 - **Alert Count** – Highlights how many alerts are currently active.
 - **Latest Alert** – Compact stat that displays the most recent non-empty alert payload (falls back to “No active alerts” when the field is empty).
 - **Power Flows** – Time series of site, solar, battery, and load power (Watts) plotted together for quick comparisons.

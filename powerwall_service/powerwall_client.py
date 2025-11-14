@@ -93,15 +93,21 @@ class PowerwallPoller:
         self._last_connection_attempt = 0.0  # Timestamp of last connection attempt
         self._backoff_base = 30.0  # Base backoff time in seconds (30s)
         self._backoff_max = 300.0  # Maximum backoff time (5 minutes)
+        self._client_error_count = 0  # Track errors on current client instance
+        self._max_client_errors = 5  # Force new client after this many errors on same instance
 
     def close(self) -> None:
+        """Close the Powerwall connection and reset state completely."""
         if self._powerwall and getattr(self._powerwall, "client", None):
             try:
                 self._powerwall.client.close_session()
             except Exception as exc:  # pragma: no cover - best effort cleanup
                 LOGGER.debug("Failed to close Powerwall session: %s", exc)
+        
+        # CRITICAL: Always null out the client to force fresh object creation
         self._powerwall = None
         self._consecutive_auth_failures = 0
+        self._client_error_count = 0  # Reset error count when we destroy the client
         # Don't reset connection failures here - we want to track them across close/reopen
 
     def _ensure_connection(self, force_reconnect: bool = False) -> None:
@@ -114,11 +120,15 @@ class PowerwallPoller:
             LOGGER.info("Forcing full reconnection to Powerwall (auth failures: %d)", 
                        self._consecutive_auth_failures)
             self.close()
-        elif self._powerwall and self._powerwall.is_connected():
+        elif self._powerwall:
+            # Even if we have a client, it might be in a bad state
+            # Don't trust is_connected() - it can lie when session is stale
+            # Only skip reconnection if we successfully used it very recently
             return
         
-        if not self._powerwall:
-            self.close()  # Ensure clean state
+        # Force clean slate - always null out before recreating
+        if self._powerwall is not None:
+            self.close()
         
         # Implement exponential backoff instead of hard circuit breaker
         # This allows automatic recovery but with increasing delays
@@ -268,13 +278,20 @@ class PowerwallPoller:
             "power metrics"
         )
         
-        # If auth failed once, try reconnecting
+        # If auth failed once, IMMEDIATELY force full reconnect with new client object
         if power_values is None and self._consecutive_auth_failures > 0:
             if self._consecutive_auth_failures < self._max_auth_failures:
-                LOGGER.info("Attempting reconnection to recover from auth error")
+                LOGGER.info("Auth error detected - forcing full client recreation")
+                # Close and null out client to force brand new object
                 self.close()
-                self._ensure_connection(force_reconnect=True)
-                power_values = self._powerwall.power()
+                # This will create a completely new pypowerwall.Powerwall instance
+                self._ensure_connection(force_reconnect=False)
+                # Try again with fresh client
+                if self._powerwall:
+                    power_values = self._fetch_with_auth_retry(
+                        self._powerwall.power,
+                        "power metrics (after reconnect)"
+                    )
         
         return power_values
 
@@ -359,6 +376,7 @@ class PowerwallPoller:
         - Detects network failures and raises PowerwallUnavailableError
         - Detects authentication failures and forces reconnection after threshold
         - Automatically retries with full session recreation on auth errors
+        - Forces new client instance if same client produces too many errors
         
         Returns:
             Dictionary containing all Powerwall metrics
@@ -366,6 +384,14 @@ class PowerwallPoller:
         Raises:
             PowerwallUnavailableError: When the Powerwall is unreachable or auth fails repeatedly
         """
+        # CRITICAL: If this client instance has produced too many errors, kill it
+        if self._client_error_count >= self._max_client_errors:
+            LOGGER.warning(
+                "Client instance has %d errors - forcing complete recreation",
+                self._client_error_count
+            )
+            self.close()  # This will null out client and reset error count
+        
         # Check if we need to force reconnect due to repeated auth failures
         force_reconnect = self._consecutive_auth_failures >= self._max_auth_failures
         
@@ -381,18 +407,23 @@ class PowerwallPoller:
             # Build and return snapshot
             snapshot = self._build_snapshot(power_values, status, vitals)
             
-            # Success! Reset auth failure counter
+            # Success! Reset ALL counters
             if self._consecutive_auth_failures > 0:
                 LOGGER.info("Successfully recovered from previous auth failures")
-                self._consecutive_auth_failures = 0
+            self._consecutive_auth_failures = 0
+            self._client_error_count = 0  # Reset on success
             
             return snapshot
             
         except PowerwallUnavailableError:
+            # Track that this client instance produced an error
+            self._client_error_count += 1
             # Already a PowerwallUnavailableError, just close and re-raise
             self.close()
             raise
         except Exception as exc:
+            # Track that this client instance produced an error
+            self._client_error_count += 1
             # Unexpected error - check if it's connection-related
             if _is_connection_error(exc):
                 self.close()

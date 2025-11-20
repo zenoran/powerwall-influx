@@ -371,19 +371,24 @@ class PowerwallService:
                     int(time_since_last_wifi_attempt)
                 )
                 try:
-                    maybe_connect_wifi(self._config)
+                    wifi_reconnected = maybe_connect_wifi(self._config)
                     self._last_wifi_error = None  # Success
-                    # WiFi reconnection succeeded - reset connection failure counter
-                    # to allow immediate reconnection attempt on next poll
-                    if hasattr(self._poller, '_consecutive_connection_failures'):
+                    # CRITICAL FIX: Only reset backoff if WiFi actually reconnected
+                    # Don't reset if we were already connected - that doesn't fix the gateway issue
+                    if wifi_reconnected and hasattr(self._poller, '_consecutive_connection_failures'):
                         if self._poller._consecutive_connection_failures > 0:
                             LOGGER.info(
-                                "WiFi reconnected successfully, resetting connection failure counter "
+                                "WiFi reconnected successfully (was disconnected), resetting connection failure counter "
                                 "(%d failures) to allow reconnection",
                                 self._poller._consecutive_connection_failures
                             )
                             self._poller._consecutive_connection_failures = 0
                             self._poller._last_connection_attempt = 0.0  # Reset backoff timer
+                    elif not wifi_reconnected:
+                        LOGGER.debug(
+                            "WiFi already connected - not resetting backoff counter (%d failures remain)",
+                            self._poller._consecutive_connection_failures if hasattr(self._poller, '_consecutive_connection_failures') else 0
+                        )
                 except Exception as exc:  # pragma: no cover - environment dependent
                     self._last_wifi_error = str(exc)
                     LOGGER.warning("Wi-Fi reconnection attempt failed: %s", exc)

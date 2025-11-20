@@ -121,10 +121,24 @@ def _find_connection_by_ssid(ssid: str) -> Optional[str]:
     return None
 
 
-def connect_to_wifi(ssid: str, password: Optional[str], interface: Optional[str], timeout: int) -> None:
+def connect_to_wifi(ssid: str, password: Optional[str], interface: Optional[str], timeout: int) -> bool:
+    """Connect to the specified WiFi network.
+    
+    Args:
+        ssid: The WiFi network SSID to connect to
+        password: The WiFi password (optional)
+        interface: The network interface to use (optional)
+        timeout: Maximum time in seconds to wait for connection
+        
+    Returns:
+        True if a new connection was established, False if already connected
+        
+    Raises:
+        WiFiConnectionError: If connection fails
+    """
     if _is_connected_to_ssid(ssid):
         LOGGER.info("Already connected to Wi-Fi SSID '%s'.", ssid)
-        return
+        return False  # Already connected - no reconnection performed
 
     # First try to activate existing connection profile
     existing_connection = _find_connection_by_ssid(ssid)
@@ -137,7 +151,7 @@ def connect_to_wifi(ssid: str, password: Optional[str], interface: Optional[str]
             while time.time() < deadline:
                 if _is_connected_to_ssid(ssid):
                     LOGGER.info("Successfully activated existing connection '%s'.", existing_connection)
-                    return
+                    return True  # Successfully reconnected
                 time.sleep(1)
         else:
             LOGGER.debug("Failed to activate existing connection profile: %s", proc.stderr.strip())
@@ -161,7 +175,7 @@ def connect_to_wifi(ssid: str, password: Optional[str], interface: Optional[str]
     while time.time() < deadline:
         if _is_connected_to_ssid(ssid):
             LOGGER.info("Successfully connected to '%s'.", ssid)
-            return
+            return True  # Successfully reconnected
         time.sleep(1)
 
     active_name = _active_connection_name(interface)

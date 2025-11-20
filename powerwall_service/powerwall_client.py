@@ -106,7 +106,6 @@ class PowerwallPoller:
         
         # CRITICAL: Always null out the client to force fresh object creation
         self._powerwall = None
-        self._consecutive_auth_failures = 0
         self._client_error_count = 0  # Reset error count when we destroy the client
         # Don't reset connection failures here - we want to track them across close/reopen
 
@@ -225,9 +224,9 @@ class PowerwallPoller:
             raise
 
     def _fetch_with_auth_retry(
-        self, 
-        fetch_func: Callable[[], Any], 
-        data_type: str
+        self,
+        fetch_func: Callable[[], Any],
+        data_type: str,
     ) -> Any:
         """Fetch data with authentication error handling and retry logic.
         
@@ -244,71 +243,74 @@ class PowerwallPoller:
         Raises:
             PowerwallUnavailableError: If auth fails repeatedly or connection fails
         """
-        try:
-            return fetch_func()
-        except Exception as exc:
-            if _is_auth_error(exc):
-                self._consecutive_auth_failures += 1
-                LOGGER.warning(
-                    "Authentication error fetching %s (failure %d/%d): %s",
-                    data_type,
-                    self._consecutive_auth_failures,
-                    self._max_auth_failures,
-                    exc,
-                )
-                if self._consecutive_auth_failures >= self._max_auth_failures:
+        max_attempts = max(1, self._max_auth_failures)
+        attempt = 0
+
+        while attempt < max_attempts:
+            try:
+                return fetch_func()
+            except Exception as exc:
+                if _is_auth_error(exc):
+                    attempt += 1
+                    self._consecutive_auth_failures += 1
+                    LOGGER.warning(
+                        "Authentication error fetching %s (attempt %d/%d, failure %d total): %s",
+                        data_type,
+                        attempt,
+                        max_attempts,
+                        self._consecutive_auth_failures,
+                        exc,
+                    )
+
+                    # Tear down the stale session before retrying
+                    self.close()
+
+                    if attempt < max_attempts:
+                        LOGGER.info(
+                            "Retrying %s after forcing Powerwall re-authentication (attempt %d of %d)",
+                            data_type,
+                            attempt + 1,
+                            max_attempts,
+                        )
+                        # This will raise PowerwallUnavailableError if reconnection is not yet allowed
+                        self._ensure_connection(force_reconnect=True)
+                        assert self._powerwall is not None
+                        continue
+
                     raise PowerwallUnavailableError(
                         f"Authentication failed {self._consecutive_auth_failures} times, "
                         f"unable to authenticate with Powerwall at {self._config.host}"
                     ) from exc
-                return None
-            elif _is_connection_error(exc):
-                raise PowerwallUnavailableError(
-                    f"Unable to retrieve {data_type} from Powerwall at {self._config.host}"
-                ) from exc
-            else:
+                if _is_connection_error(exc):
+                    raise PowerwallUnavailableError(
+                        f"Unable to retrieve {data_type} from Powerwall at {self._config.host}"
+                    ) from exc
+
                 LOGGER.debug("Failed to fetch %s: %s", data_type, exc)
                 return None
 
     def _fetch_power_metrics(self) -> Optional[Dict[str, float]]:
         """Fetch power metrics with auth retry logic."""
         assert self._powerwall is not None
-        power_values = self._fetch_with_auth_retry(
-            self._powerwall.power,
-            "power metrics"
+        return self._fetch_with_auth_retry(
+            lambda: self._powerwall.power(),
+            "power metrics",
         )
-        
-        # If auth failed once, IMMEDIATELY force full reconnect with new client object
-        if power_values is None and self._consecutive_auth_failures > 0:
-            if self._consecutive_auth_failures < self._max_auth_failures:
-                LOGGER.info("Auth error detected - forcing full client recreation")
-                # Close and null out client to force brand new object
-                self.close()
-                # This will create a completely new pypowerwall.Powerwall instance
-                self._ensure_connection(force_reconnect=False)
-                # Try again with fresh client
-                if self._powerwall:
-                    power_values = self._fetch_with_auth_retry(
-                        self._powerwall.power,
-                        "power metrics (after reconnect)"
-                    )
-        
-        return power_values
 
     def _fetch_status_data(self) -> Optional[Dict[str, Any]]:
         """Fetch status data with auth retry logic."""
         assert self._powerwall is not None
         return self._fetch_with_auth_retry(
-            self._powerwall.status,
-            "status"
+            lambda: self._powerwall.status(),
+            "status",
         )
 
     def _fetch_vitals_data(self) -> Optional[Dict[str, Any]]:
         """Fetch vitals data with auth retry logic."""
         assert self._powerwall is not None
         return self._fetch_with_auth_retry(
-            self._powerwall.vitals,
-            "vitals"
+            lambda: self._powerwall.vitals(),
+            "vitals",
         )
 
     def _build_snapshot(
@@ -369,6 +371,24 @@ class PowerwallPoller:
         
         return snapshot
 
+    def _validate_snapshot(self, snapshot: Dict[str, Any]) -> Optional[list[str]]:
+        """Return a list of missing required fields if the snapshot is incomplete."""
+        missing: list[str] = []
+        required_root_fields = ["site_name", "firmware", "din", "battery_percentage"]
+        for field in required_root_fields:
+            value = snapshot.get(field)
+            if value is None or (isinstance(value, str) and not value.strip()):
+                missing.append(field)
+
+        power = snapshot.get("power")
+        if not isinstance(power, dict):
+            missing.append("power")
+        else:
+            if all(power.get(key) is None for key in ("site", "solar", "battery", "load")):
+                missing.append("power")
+
+        return missing or None
+
     def fetch_snapshot(self) -> Dict[str, object]:
         """Fetch a complete snapshot of Powerwall metrics.
         
@@ -404,8 +424,26 @@ class PowerwallPoller:
             status = self._fetch_status_data()
             vitals = self._fetch_vitals_data()
 
-            # Build and return snapshot
+            # Build snapshot and ensure it is complete before declaring success
             snapshot = self._build_snapshot(power_values, status, vitals)
+            missing_fields = self._validate_snapshot(snapshot)
+            if missing_fields:
+                self._consecutive_connection_failures += 1
+                self._last_connection_attempt = time.monotonic()
+                next_backoff = min(
+                    self._backoff_base * (2 ** (self._consecutive_connection_failures - 1)),
+                    self._backoff_max,
+                )
+                LOGGER.warning(
+                    "Incomplete snapshot detected (failure %d, next retry in %.0fs): missing %s",
+                    self._consecutive_connection_failures,
+                    next_backoff,
+                    ", ".join(sorted(missing_fields)),
+                )
+                self.close()
+                raise PowerwallUnavailableError(
+                    "Snapshot missing required fields: " + ", ".join(sorted(missing_fields))
+                )
             
             # Success! Reset ALL counters
             if self._consecutive_auth_failures > 0:
@@ -415,11 +453,16 @@ class PowerwallPoller:
             
             return snapshot
             
-        except PowerwallUnavailableError:
+        except PowerwallUnavailableError as exc:
             # Track that this client instance produced an error
             self._client_error_count += 1
-            # Already a PowerwallUnavailableError, just close and re-raise
-            self.close()
+            
+            # CRITICAL FIX: Don't close() if we're in backoff!
+            # Check if this exception is from backoff delay
+            if "Backoff active" not in str(exc):
+                # Not a backoff error - close the client so next attempt recreates it
+                self.close()
+            # Otherwise leave client null and counters intact for backoff to work
             raise
         except Exception as exc:
             # Track that this client instance produced an error

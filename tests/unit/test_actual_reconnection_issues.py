@@ -12,6 +12,9 @@ NOT testing backoff logic - that's just rate limiting, not the core issue.
 import time
 import unittest
 from unittest.mock import Mock, patch, MagicMock
+
+from requests.exceptions import HTTPError
+
 from powerwall_service.config import ServiceConfig
 
 
@@ -60,6 +63,15 @@ def create_test_config(**kwargs):
     return ServiceConfig(**defaults)
 
 
+def make_http_error(status_code: int = 403) -> HTTPError:
+    """Create an HTTPError with a mock response status for testing."""
+    response = Mock()
+    response.status_code = status_code
+    error = HTTPError(f"{status_code} error")
+    error.response = response
+    return error
+
+
 class TestStaleConnectionRecreation(unittest.TestCase):
     """Test that stale Powerwall connection objects are properly recreated."""
 
@@ -73,20 +85,19 @@ class TestStaleConnectionRecreation(unittest.TestCase):
         This is the ROOT CAUSE of the 12-hour outage:
         - Initial connection succeeds
         - Connection dies (network issue, timeout, etc.)
-        - is_connected() returns True (stale state)
-        - We never create a new Powerwall() object
-        - Service stuck forever with dead connection
+        - fetch_snapshot() gets ConnectionError
+        - close() is called, nulling out client
+        - Next fetch creates NEW Powerwall() object
+        - Service recovers automatically
         """
-        from powerwall_service.clients import PowerwallPoller
+        from powerwall_service.clients import PowerwallPoller, PowerwallUnavailableError
         
         # First connection succeeds
         mock_pw_instance1 = MagicMock()
-        mock_pw_instance1.is_connected.return_value = True
         mock_pw_instance1.power.return_value = {'battery': 1000}
         
         # Second instance for reconnection
         mock_pw_instance2 = MagicMock()
-        mock_pw_instance2.is_connected.return_value = True
         mock_pw_instance2.power.return_value = {'battery': 2000}
         
         mock_powerwall_class.side_effect = [mock_pw_instance1, mock_pw_instance2]
@@ -101,16 +112,24 @@ class TestStaleConnectionRecreation(unittest.TestCase):
             self.assertEqual(mock_powerwall_class.call_count, 1, 
                            "Should create Powerwall object once")
             
-            # Simulate connection death - is_connected() now returns False
-            mock_pw_instance1.is_connected.return_value = False
+            # Simulate connection death - next power() call raises ConnectionError
+            mock_pw_instance1.power.side_effect = ConnectionError("Connection reset by peer")
             
-            # Next fetch should detect dead connection and CREATE NEW OBJECT
+            # Next fetch should detect dead connection, call close(), and fail
+            with self.assertRaises(PowerwallUnavailableError):
+                poller.fetch_snapshot()
+            
+            # Client should have been closed (set to None)
+            self.assertIsNone(poller._powerwall, 
+                            "Client should be None after connection error")
+            
+            # Next fetch should CREATE NEW OBJECT (because client is None)
             snapshot2 = poller.fetch_snapshot()
             power2 = snapshot2.get('power', {})  # type: ignore
             self.assertEqual(power2.get('battery'), 2000,  # type: ignore
                            "Should get data from NEW Powerwall object")
             self.assertEqual(mock_powerwall_class.call_count, 2,
-                           "Should create NEW Powerwall object when connection dies")
+                           "Should create NEW Powerwall object after connection failure")
             
         finally:
             poller.close()
@@ -143,6 +162,38 @@ class TestStaleConnectionRecreation(unittest.TestCase):
             self.assertIn("Unable to retrieve power metrics", str(ctx.exception),
                         "Should raise PowerwallUnavailableError for connection errors")
             
+        finally:
+            poller.close()
+
+    @patch('powerwall_service.powerwall_client.pypowerwall.Powerwall')
+    def test_incomplete_snapshot_treated_as_failure(self, mock_powerwall_class):
+        """Snapshots missing critical fields should trigger PowerwallUnavailableError."""
+        from powerwall_service.clients import PowerwallPoller, PowerwallUnavailableError
+
+        mock_pw = MagicMock()
+        mock_pw.power.return_value = {
+            'site': 0.0,
+            'solar': 0.0,
+            'battery': 0.0,
+            'load': 0.0,
+        }
+        mock_pw.status.return_value = None
+        mock_pw.vitals.return_value = None
+        mock_pw.site_name.return_value = None
+        mock_pw.version.return_value = None
+        mock_pw.din.return_value = None
+        mock_pw.level.return_value = None
+        mock_powerwall_class.return_value = mock_pw
+
+        poller = PowerwallPoller(self.config)
+        try:
+            with self.assertRaises(PowerwallUnavailableError) as ctx:
+                poller.fetch_snapshot()
+
+            self.assertIn("Snapshot missing required fields", str(ctx.exception))
+            self.assertIsNone(poller._powerwall)
+            self.assertGreaterEqual(poller._consecutive_connection_failures, 1)
+            self.assertGreater(poller._last_connection_attempt, 0.0)
         finally:
             poller.close()
 
@@ -183,6 +234,90 @@ class TestStaleConnectionRecreation(unittest.TestCase):
             
         finally:
             poller.close()
+
+    @patch('powerwall_service.powerwall_client.pypowerwall.Powerwall')
+    def test_auth_error_triggers_session_refresh(self, mock_powerwall_class):
+        """403 responses should force immediate session recreation without manual restart."""
+        from powerwall_service.clients import PowerwallPoller
+
+        first_client = MagicMock()
+        first_client.power.side_effect = make_http_error()
+        first_client.status.return_value = {"control": {"alerts": {"active": []}}}
+        first_client.vitals.return_value = {}
+        first_client.site_name.return_value = "Site A"
+        first_client.version.return_value = "1.0"
+        first_client.din.return_value = "DIN123"
+        first_client.level.return_value = 75.0
+        first_client.grid_status = MagicMock(return_value="UP")
+
+        second_client = MagicMock()
+        second_client.power.return_value = {
+            'site': 10.0,
+            'solar': 20.0,
+            'battery': 30.0,
+            'load': 5.0,
+        }
+        second_client.status.return_value = {"control": {"alerts": {"active": []}}}
+        second_client.vitals.return_value = {}
+        second_client.site_name.return_value = "Site A"
+        second_client.version.return_value = "1.0"
+        second_client.din.return_value = "DIN123"
+        second_client.level.return_value = 75.0
+        second_client.grid_status = MagicMock(return_value="UP")
+
+        mock_powerwall_class.side_effect = [first_client, second_client]
+
+        poller = PowerwallPoller(self.config)
+        try:
+            snapshot = poller.fetch_snapshot()
+        finally:
+            poller.close()
+
+        power = snapshot.get('power', {})  # type: ignore
+        self.assertEqual(power.get('battery'), 30.0)  # type: ignore[attr-defined]
+        self.assertEqual(mock_powerwall_class.call_count, 2,
+                         "Auth failure should recreate session immediately")
+        self.assertEqual(poller._consecutive_auth_failures, 0,
+                         "Auth counters should reset after successful snapshot")
+
+    @patch('powerwall_service.powerwall_client.pypowerwall.Powerwall')
+    def test_auth_error_raises_after_retry_budget(self, mock_powerwall_class):
+        """After exhausting retry attempts we should raise PowerwallUnavailableError."""
+        from powerwall_service.clients import PowerwallPoller, PowerwallUnavailableError
+
+        first_client = MagicMock()
+        first_client.power.side_effect = make_http_error()
+        first_client.status.return_value = {"control": {"alerts": {"active": []}}}
+        first_client.vitals.return_value = {}
+        first_client.site_name.return_value = "Site A"
+        first_client.version.return_value = "1.0"
+        first_client.din.return_value = "DIN123"
+        first_client.level.return_value = 75.0
+        first_client.grid_status = MagicMock(return_value="UP")
+
+        second_client = MagicMock()
+        second_client.power.side_effect = make_http_error()
+        second_client.status.return_value = {"control": {"alerts": {"active": []}}}
+        second_client.vitals.return_value = {}
+        second_client.site_name.return_value = "Site A"
+        second_client.version.return_value = "1.0"
+        second_client.din.return_value = "DIN123"
+        second_client.level.return_value = 75.0
+        second_client.grid_status = MagicMock(return_value="UP")
+
+        mock_powerwall_class.side_effect = [first_client, second_client]
+
+        poller = PowerwallPoller(self.config)
+        poller._max_auth_failures = 2  # Allow one retry before giving up
+
+        try:
+            with self.assertRaises(PowerwallUnavailableError):
+                poller.fetch_snapshot()
+        finally:
+            poller.close()
+
+        self.assertEqual(mock_powerwall_class.call_count, 2,
+                         "Should create a new client for the retry before failing")
 
 
 class TestWiFiReconnectionTriggers(unittest.TestCase):
